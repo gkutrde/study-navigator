@@ -1,0 +1,16 @@
+# 凭证与本地数据，永不进仓库
+.env
+notes/
+books/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 调试残渣与备份（dsh 测试产物，不删除但也不进仓库）
+_*.html
+_*.png
+*.bak
+*.bak-*
+check-card*
+console-check.js
+verify.bat
