@@ -47,14 +47,20 @@ def build_chat_command_line(
     *,
     profile_path: str | None = None,
 ) -> str:
-    '''构造要交给 cmd /k 的一条命令。'''
+    '''构造要交给 cmd /k 的一条命令。
+
+    question 参数**保留但忽略**（T-036）：早先无条件拼首问，弹窗跑的是单次模式，
+    答完只剩 cmd 提示符；现在一律进交互模式，首问由 REPL 内部预发。
+    '''
+    # T-036：**不带 question** —— 不带问题参数才会进交互模式（REPL），
+    # 由 REPL 启动时预发第一条引导提问。带着问题跑的是单次模式，答完窗口就只剩 cmd 提示符
+    # （客户反馈"弹终端后不能直接对话"就是这个原因）。
     parts = [
         quote_for_cmd(executable),
         "-m",
         "src.cli",
         "chat",
         quote_for_cmd(str(when)),
-        quote_for_cmd(question or FIRST_QUESTIONS[0]),
     ]
     if profile_path:
         parts.extend(["--profile", quote_for_cmd(str(profile_path))])
@@ -70,7 +76,8 @@ def build_start_argv(
 ) -> list[str]:
     '''cmd /c start + 空标题 + cmd /k 的 argv。'''
     comspec = os.environ.get("COMSPEC") or "cmd.exe"
-    line = build_chat_command_line(executable, when, question, profile_path=profile_path)
+    # 同样不带 question：弹窗一律进交互模式（T-036）
+    line = build_chat_command_line(executable, when, profile_path=profile_path)
     return [comspec, "/c", "start", "", "cmd", "/k", line]
 
 

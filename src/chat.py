@@ -28,6 +28,7 @@ import shutil
 import subprocess
 
 from .handoff import handoff_dir, handoff_path, task_file_id
+from .silent import silent_kwargs
 
 
 class ChatError(Exception):
@@ -219,13 +220,35 @@ def headless_persona_override(home: Path | str | None = None) -> str | None:
     return str(patch) if match else None
 
 
+# ANSI 颜色/光标控制码：stderr 的推理流常带，展示前清掉
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+class ChatReply(str):
+    """一次调用的结果。
+
+    **是 str 的子类**：老调用方（T-032/T-034）把它当字符串用照旧能跑，
+    新调用方（T-037）可以读 .answer 与 .thinking。
+    """
+
+    def __new__(cls, answer: str, thinking: str = ""):
+        obj = super().__new__(cls, answer)
+        obj.answer = answer
+        obj.thinking = thinking
+        return obj
+
+
 def chat_once(
     executable: str,
     prompt: str,
     *,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
-) -> str:
-    """调一次 dsh headless，返回它的输出（stdout）。"""
+) -> ChatReply:
+    """调一次 dsh headless，返回答案 + 思考过程。
+
+    答案取 stdout；**思考流取 stderr，两者绝不混**（T-037）：
+    混在一起会让推理过程被当成答案正文渲染进面板。
+    """
     command = build_dsh_command(executable, prompt)
     try:
         completed = subprocess.run(
@@ -237,6 +260,8 @@ def chat_once(
             timeout=timeout,
             # 关键：不走 shell。问题里有 `; rm -rf /` 也只是普通文本。
             shell=False,
+            # T-041：静默执行——Windows 上不弹控制台窗口（跑测试时尤其重要）
+            **silent_kwargs(),
         )
     except FileNotFoundError:
         raise ChatError(
@@ -251,4 +276,6 @@ def chat_once(
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
         raise ChatError(f"dsh headless 退出码 {completed.returncode}：{detail[:400] or '(没有更多信息)'}")
-    return completed.stdout or ""
+    answer = completed.stdout or ""
+    thinking = _ANSI_RE.sub("", completed.stderr or "").strip()
+    return ChatReply(answer, thinking)

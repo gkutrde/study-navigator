@@ -272,6 +272,39 @@ def apply_alignment(
     return mapped_books
 
 
+def merge_aligned_names(
+    raw: list[BookMap],
+    aligned: list[BookMap],
+) -> list[BookMap]:
+    """把「对齐后的名字」并进「原始地图」，同一章里两套名字都留着（去重保序）。
+
+    为什么需要合并（T-047 实测）：
+    `apply_alignment` 是**替换**语义——地图点换成画像概念名之后，书上的原名就
+    没了。接力上下文有两种查法：任务卡记画像概念名（靠对齐后的名字命中）、
+    有人直接照书抄地图原名（靠原名命中）。只留一边，另一边就整段查不到。
+
+    保持章的位置与顺序；两边的章数不一致时以原始地图为准（缺的按原名走）。
+    """
+    merged: list[BookMap] = []
+    for index, raw_book in enumerate(raw):
+        aligned_book = aligned[index] if index < len(aligned) else None
+        chapters: list[Chapter] = []
+        for chapter_index, raw_chapter in enumerate(raw_book.chapters):
+            aligned_chapter = (
+                aligned_book.chapters[chapter_index]
+                if aligned_book and chapter_index < len(aligned_book.chapters)
+                else None
+            )
+            points = [str(point).strip() for point in raw_chapter.points if str(point).strip()]
+            for point in (aligned_chapter.points if aligned_chapter else []):
+                name = str(point).strip()
+                if name and name not in points:
+                    points.append(name)
+            chapters.append(Chapter(chapter=raw_chapter.chapter, points=points))
+        merged.append(BookMap(book=raw_book.book, chapters=chapters))
+    return merged
+
+
 def summary(aligned: dict[str, Alignment]) -> dict:
     """给报告用的统计：总点数、已对齐数、新增概念数、每本书的高置信度占比。"""
     total = len(aligned)

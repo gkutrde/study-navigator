@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>张三的主页 | home-min.html（档 0：只用 style 属性）</title>
+</head>
+<body style="margin: 0; font-family: system-ui, 'Microsoft YaHei', sans-serif; line-height: 1.7;">
+
+  <!-- 起点就是「本次提交的代码」那一行 <h1>张三</h1>，下面把它前后各包一段。
+       本档规矩：一条 CSS 选择器都不写，五个区块的底色全部走 style 属性。
+       代价很直观：同一个 padding 抄了五遍，改一次要改五处 —— 这就是档 1 为什么要用 <style>。 -->
+
+  <!-- ===== 1 页头 ===== -->
+  <header style="background-color: #f7e6e6; padding: 14px 20px; border: 2px solid #8a8a8a;">
+    <h1>张三的主页</h1>
+    <p>页头：站名 + 一句自我介绍 + 一张头像。</p>
+    <!-- 故意指向不存在的文件：用来验证 src 失效时 alt 会顶上来 -->
+    <img src="avatar.jpg" alt="张三的头像" width="120" height="120"
+         style="border: 1px dashed #8a8a8a;">
+  </header>
+
+  <!-- ===== 2 导航 ===== -->
+  <nav style="background-color: #e3eef7; padding: 14px 20px; border: 2px solid #8a8a8a; border-top: 0;">
+    <a href="#home">首页</a>
+    <span style="color: #8a8a8a;">|</span>
+    <a href="#blog">日志</a>
+    <span style="color: #8a8a8a;">|</span>
+    <a href="#photo">相册</a>
+    <span style="color: #8a8a8a;">|</span>
+    <a href="#about">关于我</a>
+  </nav>
+
+  <!-- ===== 3 主内容 ===== -->
+  <main id="home" style="background-color: #e9f5e4; padding: 14px 20px; border: 2px solid #8a8a8a; border-top: 0;">
+    <h2>三段短文</h2>
+
+    <p>第一段：这里是主内容。HTML 负责描述页面的结构，浏览器只按结构理解内容，不会因为我想让它变大就变大 —— 那是 CSS 的活。所以这一段只写"这是一段文字"，不去管它长什么样。</p>
+
+    <p>第二段：一个元素由开始标签、内容、结束标签三部分构成，把元素放进另一个元素里就叫嵌套。页头、导航、主内容、侧栏、页脚这五块，就是五个容器并列摆在 body 里，谁也别钻到谁里面去。</p>
+
+    <p>第三段：写完之后打开浏览器看两件事 —— 五块底色是不是分得清，删掉任意一个区块标签页面是不是还照常渲染。后者能过，说明我的标签配对和嵌套关系本身是合法的。</p>
+
+    <img src="photo.jpg" alt="主页封面图（src 指向的文件不存在时，这段字会顶上来）" width="240" height="160"
+         style="border: 1px dashed #8a8a8a;">
+  </main>
+
+  <!-- ===== 4 侧栏 ===== -->
+  <aside style="background-color: #fbf4dc; padding: 14px 20px; border: 2px solid #8a8a8a; border-top: 0;">
+    <h2>链接列表</h2>
+    <ul>
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML/Element/header">MDN：header 页头</a></li>
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML/Element/nav">MDN：nav 导航</a></li>
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML/Element/main">MDN：main 主内容</a></li>
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML/Element/aside">MDN：aside 侧栏</a></li>
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML/Element/footer">MDN：footer 页脚</a></li>
+    </ul>
+
+    <h3>顺带复习一下有序列表</h3>
+    <ol>
+      <li>先打 ! 生成文档骨架</li>
+      <li>再摆五个区块标签</li>
+      <li>最后给每块加底色</li>
+    </ol>
+  </aside>
+
+  <!-- ===== 5 页脚 ===== -->
+  <footer style="background-color: #ece8f7; padding: 14px 20px; border: 2px solid #8a8a8a; border-top: 0;">
+    <p>© 张三 · 2026-09-29 · 用 HTML 手写</p>
+  </footer>
+
+</body>
+</html>

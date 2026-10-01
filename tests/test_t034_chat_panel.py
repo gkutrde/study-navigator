@@ -3,7 +3,8 @@
 主方案要点：
 - 历史按任务在服务端隔离；对话留档 profile/handoff/<任务>.chat.md；
 - 每轮把「handoff 上下文 + 该任务对话历史 + 新消息」拼成 prompt；
-- 历史超 30000 字符时**保留 handoff 全文**、裁剪最旧轮次并注明「已裁剪 N 轮」。
+- 历史超 30000 字符时**保留 handoff 全文**；T-043 起最旧轮次压成「较早对话摘要」块，
+  没有摘要器（拿不到 LLM）时退回硬裁并注明「已裁剪 N 轮」——两条路径都在本文件里有测试。
 """
 
 from __future__ import annotations
@@ -338,8 +339,14 @@ def test_three_turns_stay_continuous(tmp_path, monkeypatch):
     assert len(turns) == 6
 
 
-def test_history_trim_keeps_handoff_in_real_prompt(tmp_path, monkeypatch):
-    """验收：历史裁剪不丢 handoff。"""
+def test_history_overflow_keeps_handoff_in_real_prompt(tmp_path, monkeypatch):
+    """验收：历史超限后**不丢 handoff**，且超长部分走摘要而不是硬裁。
+
+    T-043 起契约变了：走看板（有 LLM）时，最旧轮次会被压成「较早对话摘要」，
+    不再打「已裁剪 N 轮」。硬裁只是**没有摘要器时**的兜底（见
+    test_build_prompt_keeps_handoff_when_history_huge —— 那条是直调 build_prompt，
+    没有 summarizer，所以那条的「已裁剪」断言仍然成立）。
+    """
     directory = make_directory(tmp_path)
     seen = _stub_llm(monkeypatch, ["很长" * 4000])
     board = make_board(tmp_path, directory)
@@ -348,9 +355,12 @@ def test_history_trim_keeps_handoff_in_real_prompt(tmp_path, monkeypatch):
         board.run_action("chat", {"task": "2026-09-27 10:00", "message": "问题" + str(index)})
 
     last = seen[-1]
-    assert len(last) <= MAX_PROMPT_CHARS
-    assert "DSH 接力上下文" in last
-    assert "已裁剪" in last
+    assert len(last) <= MAX_PROMPT_CHARS, "prompt 不能超上限"
+    assert "DSH 接力上下文" in last, "handoff 全文不能被裁掉"
+    assert "较早对话摘要" in last, "超长部分要压成摘要块"
+    assert "已裁剪" not in last, "走摘要路径时不该再出现硬裁标记"
+    # 摘要块里要有"覆盖了多少轮"的说明，便于判断丢了什么
+    assert "已压缩成摘要" in last
 
 
 def test_chat_action_reports_missing_handoff(tmp_path, monkeypatch):
@@ -538,8 +548,11 @@ def test_cli_chat_without_question_enters_repl(tmp_path, monkeypatch, capsys):
     assert code == 0, out.err
     assert "交互回答" in out.out
     assert "你：" in out.out
+    # T-036 起：进 REPL 会先自动问一条引导提问，所以留档是"首问+回答，再+追问+回答"
     turns = load_turns(directory, "2026-09-27 10:00")
-    assert [t.role for t in turns] == ["user", "assistant"]
+    assert [t.role for t in turns] == ["user", "assistant", "user", "assistant"]
+    assert "我的代码哪里不足" in turns[0].text, "第一条应是引导提问"
+    assert turns[2].text == "追问一"
 
 
 def test_cli_chat_single_shot_also_archives(tmp_path, monkeypatch, capsys):

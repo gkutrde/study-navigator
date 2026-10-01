@@ -55,10 +55,11 @@ USAGE = (
     + "  python -m src.cli chat <任务时间戳> [\"问题\"]   # 终端接力：带问题单次答；不带问题进交互模式（T-032/T-034）\n"
     + "  python -m src.cli review <任务时间戳> <代码文件>   # 作业点评（T-028）\n"
     + "  python -m src.cli chat <任务时间戳> \"问题\"   # 终端接力：读接力上下文问 DSH（T-032）\n"
+    + "  python -m src.cli report [--days N] [--profile <画像路径>]   # 周报复盘（T-044）\n"
     + "  python -m src.cli serve [--port 8765] [--no-browser]   # 本地互动看板"
 )
 # T-032：chat 是终端接力命令（读 handoff + 调 dsh headless）
-KNOWN_COMMANDS = ("sync", "import", "distill", "align", "explain", "review", "chat", "next", "done", "serve")
+KNOWN_COMMANDS = ("sync", "import", "distill", "align", "explain", "review", "chat", "next", "done", "report", "serve")
 DEFAULT_SERVE_PORT = 8765
 # 提炼状态文件：记录每篇笔记的内容指纹，用于「跳过未变更」的增量提炼（T-017 I-2）
 DEFAULT_STATE_NAME = ".distill-state.json"
@@ -817,16 +818,37 @@ def _build_board(
         调 dsh headless 拿回答，**问答都写进该任务的留档**。
         """
         from .chat import ChatError, chat_once, find_dsh, read_handoff
-        from .chat_session import ChatSessionError, append_turn, build_prompt, load_turns
+        from .chat_session import (
+            ChatSessionError,
+            append_turn,
+            build_prompt,
+            build_summarizer,
+            load_turns,
+        )
 
         try:
             context = read_handoff(target.parent, task)
         except ChatError as exc:
             raise RuntimeError(str(exc)) from None
 
+        # T-043：历史超长时把最旧轮次压成摘要（走真 LLM），摘要落盘缓存
+        try:
+            summarizer = build_summarizer(
+                make_llm_completer(env_path=env_path, home=home)
+            )
+        except Exception:
+            summarizer = None  # 拿不到 LLM 时退回硬裁，不影响本轮
+
         try:
             turns = load_turns(target.parent, task)
-            prompt = build_prompt(context, turns, message)
+            prompt = build_prompt(
+                context,
+                turns,
+                message,
+                summarizer=summarizer,
+                profile_dir=target.parent,
+                when=task,
+            )
         except ChatSessionError as exc:
             raise RuntimeError(str(exc)) from None
 
@@ -843,7 +865,14 @@ def _build_board(
 
         try:
             append_turn(target.parent, task, role="user", text=message)
-            append_turn(target.parent, task, role="assistant", text=answer.strip())
+            append_turn(
+                target.parent,
+                task,
+                role="assistant",
+                text=answer.strip(),
+                # T-037：思考流单独存，别混进答案
+                thinking=getattr(answer, "thinking", ""),
+            )
         except ChatSessionError as exc:
             raise RuntimeError(f"写对话留档失败：{exc}") from None
 
@@ -882,6 +911,20 @@ def _build_board(
             books = load_syllabus(syllabus_file) if syllabus_file.is_file() else []
         except Exception:
             books = []
+        # T-047：和 next 同口径——先 apply_alignment 再查出处。地图里存的是书上的
+        # 原话（「id 做页面内锚点」），任务卡记的是画像概念名（「超链接 a 标签
+        # （href/target）」）；不做这一步，第 4 段会整段找不到——实测这道 nav 题的
+        # 4 个知识点全部落到 None。
+        try:
+            from .alignment import apply_alignment, load_alignment, merge_aligned_names
+
+            aligned_map = load_alignment(target.parent / DEFAULT_ALIGNMENT_NAME)
+            if books and aligned_map:
+                # 两套名字都留着查：任务卡记的是画像概念名（「超链接 a 标签（href/target）」），
+                # 也有人直接照书抄地图原名（「id 做页面内锚点」）——merge 后两种都能命中。
+                books = merge_aligned_names(books, apply_alignment(books, aligned_map))
+        except Exception:
+            pass  # 对齐失败就退回原始地图，不能因此让接力文件生成不出来
 
         try:
             path = write_handoff(
@@ -902,12 +945,16 @@ def _build_board(
             shown = path
         questions = build_questions(entry, profile)
         # T-033：顺手弹一个终端窗口（非 Windows / 失败都静默降级，不影响结果）
+        # T-049：默认**不弹**——入口已收敛到插件面板；DSH_TERMINAL_POPUP=1 才恢复
+        from .dashboard import terminal_popup_enabled
+
         launched = False
         try:
             from .terminal import FIRST_QUESTIONS, current_python
 
             launched = bool(
-                _terminal_launcher()(
+                terminal_popup_enabled()
+                and _terminal_launcher()(
                     current_python(),
                     entry.when,
                     FIRST_QUESTIONS[0],
@@ -1199,6 +1246,59 @@ def _run_done(
     return 0
 
 
+def _run_report(
+    rest: list[str],
+    *,
+    profile_path: Path | str | None = None,
+    repo_root: Path | str | None = None,
+) -> int:
+    """T-044：周报复盘——把窗口内的学习活动汇总成 markdown。"""
+    from .report import DEFAULT_DAYS, build_report
+
+    days = DEFAULT_DAYS
+    profile_override: str | None = None
+    index = 0
+    while index < len(rest):
+        item = rest[index]
+        if item == "--days":
+            if index + 1 >= len(rest):
+                print("--days 后面要跟天数" + chr(10) + USAGE, file=sys.stderr)
+                return 2
+            try:
+                days = int(rest[index + 1])
+            except ValueError:
+                print(
+                    f"--days 必须是整数（收到 {rest[index + 1]}）" + chr(10) + USAGE,
+                    file=sys.stderr,
+                )
+                return 2
+            if days < 1:
+                print("--days 必须 >= 1" + chr(10) + USAGE, file=sys.stderr)
+                return 2
+            index += 2
+            continue
+        if item == "--profile":
+            if index + 1 >= len(rest):
+                print("--profile 后面要跟画像文件路径" + chr(10) + USAGE, file=sys.stderr)
+                return 2
+            profile_override = rest[index + 1]
+            index += 2
+            continue
+        print(f"report 不认识参数：{item}" + chr(10) + USAGE, file=sys.stderr)
+        return 2
+
+    target = Path(profile_override) if profile_override else (
+        Path(profile_path) if profile_path else DEFAULT_PROFILE_PATH
+    )
+    if not target.is_file():
+        print(f"找不到画像文件：{target}：先运行 sync + distill", file=sys.stderr)
+        return 1
+
+    root = Path(repo_root) if repo_root else target.parent.parent
+    print(build_report(target.parent, days=days, repo_root=root), end="")
+    return 0
+
+
 def _run_chat(
     rest: list[str],
     env_path: Path | str = DEFAULT_ENV_PATH,
@@ -1244,8 +1344,22 @@ def _run_chat(
 
     if question is None:
         # 交互模式：每轮把 handoff + 该任务历史 + 新消息拼成 prompt
-        from .chat_session import ChatSessionError, append_turn, build_prompt, load_turns
+        from .chat_session import (
+            ChatSessionError,
+            append_turn,
+            build_prompt,
+            build_summarizer,
+            load_turns,
+        )
         from .repl import run_repl
+
+        # T-043：REPL 也一样——超长历史压成摘要并落盘缓存
+        try:
+            repl_summarizer = build_summarizer(
+                make_llm_completer(env_path=env_path, home=home)
+            )
+        except Exception:
+            repl_summarizer = None
 
         try:
             context = read_handoff(target.parent, when)
@@ -1263,13 +1377,30 @@ def _run_chat(
 
         def ask(message: str) -> str:
             turns = load_turns(target.parent, when)
-            prompt = build_prompt(context, turns, message)
+            prompt = build_prompt(
+                context,
+                turns,
+                message,
+                summarizer=repl_summarizer,
+                profile_dir=target.parent,
+                when=when,
+            )
             answer = chat_once(executable, prompt)
             append_turn(target.parent, when, role="user", text=message)
-            append_turn(target.parent, when, role="assistant", text=answer.strip())
+            append_turn(
+                target.parent,
+                when,
+                role="assistant",
+                text=answer.strip(),
+                thinking=getattr(answer, "thinking", ""),
+            )
             return answer.strip()
 
-        return run_repl(ask=ask)
+        # T-036：弹窗进这个循环时，启动就先自动问一条（用户打开窗口就能看到回答），
+        # 之后停在「你：」提示符等追问。
+        from .terminal import FIRST_QUESTIONS
+
+        return run_repl(ask=ask, initial=FIRST_QUESTIONS[0])
 
     try:
         context = read_handoff(target.parent, when)
@@ -1313,7 +1444,13 @@ def _run_chat(
         from .chat_session import append_turn
 
         append_turn(target.parent, when, role="user", text=question)
-        append_turn(target.parent, when, role="assistant", text=answer.strip())
+        append_turn(
+            target.parent,
+            when,
+            role="assistant",
+            text=answer.strip(),
+            thinking=getattr(answer, "thinking", ""),
+        )
     except Exception:
         pass  # 留档失败不影响这次回答
 
@@ -1659,6 +1796,8 @@ def main(
         )
     if command == "done":
         return _run_done(rest, profile_path=profile_path)
+    if command == "report":
+        return _run_report(rest, profile_path=profile_path)
     if command == "serve":
         return _run_serve(
             rest,

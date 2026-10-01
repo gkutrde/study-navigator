@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>张三 · 导航与锚点（最小可过验收版）</title>
+</head>
+<body>
+
+  <!-- 起点就是你写的那一行：<h1>张三</h1>。下面全部是"包住它"的最小增量。 -->
+
+  <!-- 实现要点 2：导航用 ul / li；要点 4：背景色走 style 属性 -->
+  <div class="nav" style="background-color: #ffe9b3; padding: 10px 14px;">
+    <ul style="list-style: none; margin: 0; padding: 0;">
+      <!-- 要点 1：href="#xxx" 与下面小节的 id="xxx" 必须逐字一致 -->
+      <li style="display: inline-block; margin-right: 20px;"><a href="#about">关于我</a></li>
+      <li style="display: inline-block; margin-right: 20px;"><a href="#skills">我会什么</a></li>
+      <li style="display: inline-block; margin-right: 20px;"><a href="#plan">接下来学什么</a></li>
+      <!-- 要点 3：外站链接用 target="_blank" 开新标签页 -->
+      <li style="display: inline-block; margin-right: 20px;"><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML" target="_blank" rel="noopener">MDN 文档（外部）</a></li>
+    </ul>
+  </div>
+
+  <h1>张三</h1>
+
+  <!-- 要点 1：每个小节 = 一个带 id 的 div，它就是链接跳过来的落点。
+       min-height 是为了让每节都够高，点了导航才看得出页面真的在滚。 -->
+  <div id="about" style="min-height: 80vh; padding: 16px 4px; border-bottom: 1px dashed #cfcfcf;">
+    <h2>关于我</h2>
+    <p>我是张三，正在从零学 HTML。</p>
+  </div>
+
+  <div id="skills" style="min-height: 80vh; padding: 16px 4px; border-bottom: 1px dashed #cfcfcf;">
+    <h2>我会什么</h2>
+    <p>标题、段落、加粗、斜体、表格、图片、列表都练过。</p>
+  </div>
+
+  <div id="plan" style="min-height: 80vh; padding: 16px 4px; border-bottom: 1px dashed #cfcfcf;">
+    <h2>接下来学什么</h2>
+    <p>把路径和页面内锚点收干净，然后进 CSS。</p>
+  </div>
+
+  <!-- 这一段不是装饰，是物理必需：浏览器能滚到的最大位置 = 文档总高 − 视口高。
+       最后一节后面不留东西，"接下来学什么"永远到不了视口顶端。 -->
+  <div style="height: 40vh;"></div>
+
+</body>
+</html>

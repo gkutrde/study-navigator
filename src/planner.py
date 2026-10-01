@@ -111,6 +111,66 @@ def describe_syllabus(syllabus: dict | None) -> str:
     return "\n".join(lines)
 
 
+# T-042：地图摘录的字符预算（实测 C++ Primer 全章节 5901 字符把 prompt 撑爆）
+SYLLABUS_EXCERPT_BUDGET = 2000
+# 选中点所在章的前后各取几章
+SYLLABUS_NEIGHBOUR_CHAPTERS = 1
+
+
+def describe_syllabus_excerpt(book, focus_point: str | None, budget: int = SYLLABUS_EXCERPT_BUDGET) -> str:
+    """只描述**这一本**书里跟 focus_point 相关的一段（T-042）。
+
+    实测的错位：选点用「与画像最相关的书」（HTML），prompt 却塞 books_map[0]
+    的**全章节**（C++ Primer，5901 字符）——LLM 看到的地图与选点依据对不上。
+
+    这里：
+    - 只放选中这本书；
+    - 只放 focus_point 所在章 ± 前后各一章；
+    - 附一行全图摘要（总章数/总点数），让模型知道还有别的；
+    - 超预算时继续砍邻章（保留选中章）。
+    """
+    chapters = list(getattr(book, "chapters", []) or [])
+    if not chapters:
+        return "（这本书没有章节信息）"
+
+    title = str(getattr(book, "book", "") or "未命名")
+    total_points = sum(len(getattr(ch, "points", []) or []) for ch in chapters)
+    summary = f"《{title}》共 {len(chapters)} 章 / {total_points} 个点（全图摘要）"
+
+    target = str(focus_point or "").strip()
+    center = 0
+    if target:
+        for index, chapter in enumerate(chapters):
+            if target in (getattr(chapter, "points", []) or []):
+                center = index
+                break
+
+    def render(index: int) -> str:
+        chapter = chapters[index]
+        name = getattr(chapter, "chapter", "") or ""
+        points = "、".join(getattr(chapter, "points", []) or [])
+        return f"- {name}：{points}"
+
+    # 邻章从近到远依次加入，超预算就停
+    order = [center]
+    for delta in range(1, SYLLABUS_NEIGHBOUR_CHAPTERS + 1):
+        for index in (center - delta, center + delta):
+            if 0 <= index < len(chapters):
+                order.append(index)
+
+    kept: list[int] = []
+    for index in order:
+        candidate = kept + [index]
+        body = chr(10).join(render(i) for i in sorted(candidate))
+        if len(body) > budget and kept:
+            break
+        kept = candidate
+
+    lines = [summary]
+    lines.extend(render(i) for i in sorted(kept))
+    return chr(10).join(lines)
+
+
 def build_next_messages(
     profile: KnowledgeProfile,
     syllabus: dict | None = None,
@@ -118,6 +178,8 @@ def build_next_messages(
     recent_goals: Sequence[str] | None = None,
     topics=None,
     weaknesses: Sequence[str] | None = None,
+    book=None,
+    focus_point: str | None = None,
 ) -> list[dict[str, str]]:
     """构造出题 messages。
 
@@ -143,7 +205,8 @@ def build_next_messages(
         else "（无）",
         "",
         "知识地图（新点优先取其中按书序的下一个未掌握点）：",
-        describe_syllabus(syllabus),
+        # T-042：传了 book 就只展示这本书的相关章——地图必须和选点依据是同一本书
+        describe_syllabus_excerpt(book, focus_point) if book is not None else describe_syllabus(syllabus),
         "",
         "请给出下一个动手任务。",
     ]
@@ -402,6 +465,96 @@ def next_unmet_point(syllabus: dict | None, profile: KnowledgeProfile) -> str | 
     return None
 
 
+def pick_book_and_point(
+    books: list | None,
+    profile: KnowledgeProfile,
+    raw_books: list | None = None,
+    topics=None,
+) -> tuple[object, str] | None:
+    """选书 + 选点，**一次做完并一起返回**（T-042）。
+
+    为什么必须一起返回：prompt 里的地图要塞"选中的那本书"，
+    而"选中哪本书"是这里的选书逻辑决定的。分成两个函数各自算一遍，
+    就会出现实测那个错位——选点用了 HTML 书、prompt 却塞了 books_map[0]（C++ Primer）。
+
+    返回 (书对象, 点)。书对象取自 raw_books（真名更有信息量），保持与 books 同序。
+    """
+    if not books:
+        return None
+
+    # T-029：过滤在**点**这一级做——只把"落在选中主题里"的点放进书。
+    #
+    # 曾经写成"按书过滤"（整本书只要有一个点匹配就留下），结果是：
+    # 「网页书」里有一个画像还未知的点（弹性盒），整本书就被留下，
+    # 于是只选「样式与布局」时仍然会挑出「网页书」的「网格布局」。
+    # 正确语义是"在选中主题里找下一个该学的点"，所以必须逐点筛。
+    wanted = normalize_topics(topics)
+    if wanted:
+        allowed = set(wanted)
+        books = [_keep_points_in_topics(book, allowed, profile) for book in books]
+        books = [book for book in books if book is not None]
+        if raw_books:
+            raw_books = [_keep_points_in_topics(book, allowed, profile) for book in raw_books]
+            raw_books = [book for book in raw_books if book is not None]
+        if not books:
+            return None
+
+    source = raw_books or books
+    mastered = {p.name for p in profile.points if p.level in MASTERED_LEVELS}
+    profile_names = {p.name for p in profile.points}
+
+    if not mastered:
+        chosen = source[0]
+        found = _first_unmet_in_book(chosen, mastered)
+        return (chosen, found) if found else None
+
+    # 没有任何书与画像有交集 → 退回第一本
+    best = None
+    best_hits = 0
+    for book in books:
+        points = {
+            str(point).strip()
+            for chapter in getattr(book, "chapters", []) or []
+            for point in getattr(chapter, "points", []) or []
+        }
+        hits = len(points & mastered)
+        if hits > best_hits:
+            best, best_hits = book, hits
+    if best is None:
+        chosen = source[0]
+        found = _first_unmet_in_book(chosen, mastered)
+        return (chosen, found) if found else None
+
+    # 选中的书若已没有"该学的新东西"，就按相关度依次看下一本（T-021 实测：
+    # HTML 书的高置信度点全已掌握时，硬塞一个未映射的零碎条目没有意义）。
+    ranked = sorted(
+        range(len(books)),
+        key=lambda i: -len(
+            {
+                str(point).strip()
+                for chapter in getattr(books[i], "chapters", []) or []
+                for point in getattr(chapter, "points", []) or []
+            }
+            & mastered
+        ),
+    )
+    for candidate_index in ranked:
+        found = _mapped_unmastered_in_book(
+            books[candidate_index],
+            source[candidate_index],
+            mastered,
+            profile_names,
+        )
+        if found:
+            # 书与点来自**同一个** candidate_index —— 这就是修掉错位的关键
+            return source[candidate_index], found
+
+    index = books.index(best)
+    chosen = source[index]
+    found = _first_unmet_in_book(chosen, mastered)
+    return (chosen, found) if found else None
+
+
 def next_unmet_point_for_books(
     books: list | None,
     profile: KnowledgeProfile,
@@ -423,7 +576,20 @@ def next_unmet_point_for_books(
     但返回给调用方的点应当取自**原始**地图（真名更有信息量）。两者顺序必须一致。
 
     注意：A-06 约束的是"点"而不是"书"——本函数只负责把"书序"落到一本合理的书上。
+
+    T-042：实现已收敛到 pick_book_and_point（选书+选点一次完成），
+    本函数只是取它的点——保证 prompt 与选点用的是**同一本书**。
     """
+    picked = pick_book_and_point(books, profile, raw_books=raw_books, topics=topics)
+    return picked[1] if picked else None
+
+
+def _legacy_next_unmet_point_for_books(
+    books: list | None,
+    profile: KnowledgeProfile,
+    raw_books: list | None = None,
+    topics=None,
+) -> str | None:
     if not books:
         return None
 
@@ -726,6 +892,16 @@ def generate_task(
             "不足以出题：请先把「存疑」的知识点补学后确认状态，或再记几篇有解释/示例的笔记"
         )
 
+    # T-042：**选书/选点只算一次**，然后同时用于「prompt 里的地图」和「A-06 校验」。
+    # 曾经是：prompt 塞 books_map[0]（C++ Primer 全章节），校验却按"最相关的书"（HTML），
+    # 于是 LLM 看到的地图跟它被要求遵守的点对不上。
+    picked_book = None
+    focus_point = None
+    if books:
+        picked = pick_book_and_point(books, scoped, raw_books=raw_books, topics=topics)
+        if picked is not None:
+            picked_book, focus_point = picked
+
     if assignments:
         # 延迟导入：planner 不反向依赖 assignments 模块的加载逻辑
         from .assignments import assignment_to_task, pick_assignment
@@ -736,7 +912,8 @@ def generate_task(
             # A-06：有地图时，任务的新点必须是地图里按书序的下一个未掌握点。
             # 题库条目自带 new_skill，可能与地图要求不一致 —— 那种情况下不能直接采用，
             # 必须回退 LLM 出题（LLM 路径下面会校验并重试）。
-            expected_new = (
+            # T-042：与 prompt 用**同一个**选择（见下面 picked_book/focus_point）
+            expected_new = focus_point or (
                 next_unmet_point_for_books(books, scoped, raw_books=raw_books, topics=topics)
                 if books
                 else next_unmet_point(syllabus, scoped)
@@ -754,6 +931,8 @@ def generate_task(
             violations=violations,
             recent_goals=recent_goals,
             weaknesses=weaknesses,
+            book=picked_book,
+            focus_point=focus_point,
         )
         try:
             raw = completer.complete(messages)

@@ -1,0 +1,48 @@
+{
+  "name": "dsh-learning-navigator",
+  "version": "0.1.0",
+  "description": "学习领航员 DSH 插件：把本地 Python 核心（画像/任务/知识地图）搬进 DSH 界面。",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "id": "dsh-learning-navigator",
+    "name": "学习领航员",
+    "permissions": "客户端面板（只读展示 + 经 CLI 子进程执行动作）",
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "react": "^19.0.0",
+    "tsdown": "^0.15.0",
+    "typescript": "^5.6.0"
+  },
+  "license": "MIT"
+}

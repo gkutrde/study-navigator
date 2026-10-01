@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>张三 · 单页导航与锚点</title>
+  <style>
+    /* 这两条只做一件事：让 ul 里的 li 从"竖着一列"变成"横着一行"。
+       ul/li 默认是块级（各占一行），排成一行必须靠 CSS —— 这就是本次的
+       块元素 / 行内元素 知识点落点。 */
+    .nav ul { list-style: none; margin: 0; padding: 0; }
+    .nav li { display: inline-block; margin-right: 20px; }
+
+    /* 每节给一个最小高度，否则内容太短、点了导航看不出页面在滚动 */
+    .section { min-height: 70vh; padding: 16px 4px; border-bottom: 1px dashed #cfcfcf; }
+  </style>
+</head>
+<body>
+
+  <!-- ========== 导航条 ==========
+       实现要点 4：用 style 属性把导航背景改成喜欢的颜色（这里是暖黄 #ffe9b3）
+       实现要点 2：导航本身用 ul / li 排成一行
+       实现要点 1：href 里的 #xxx 必须和下面小节的 id="xxx" 一模一样 -->
+  <div class="nav" style="background-color: #ffe9b3; padding: 10px 14px;">
+    <ul>
+      <li><a href="#about">关于我</a></li>
+      <li><a href="#skills">我会什么</a></li>
+      <li><a href="#plan">接下来学什么</a></li>
+      <!-- 实现要点 3：外站链接用 target="_blank" 新标签页打开；
+           rel="noopener" 是搭头的安全写法，防止新页面通过 window.opener 操纵本页 -->
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML" target="_blank" rel="noopener">MDN 文档（外部）</a></li>
+    </ul>
+  </div>
+
+  <!-- ========== 小节 1 ========== -->
+  <div class="section" id="about">
+    <h2>关于我</h2>
+    <p>我是张三，正在从零学 HTML。</p>
+    <p>这个页面同时练四件事：超链接（href / target）、列表（ul / li）、块元素与行内元素（div / span）、HTML 属性（class / id / style）。</p>
+    <p>页面里凡是 <span style="background-color: #eaf3ff;">像这样带浅蓝底的小段</span>，都是 span——行内元素，不会把文字挤到下一行。</p>
+  </div>
+
+  <!-- ========== 小节 2 ========== -->
+  <div class="section" id="skills">
+    <h2>我会什么</h2>
+    <p>目前写过带标题、段落、加粗、斜体、表格、图片、列表的练习页。</p>
+    <p>能自己搭出 <span style="background-color: #eaf3ff;">&lt;!DOCTYPE html&gt; + html + head + body</span> 的完整骨架。</p>
+    <p>刚学会给元素起 id，然后让导航链接精确跳到这个 id 所在的位置——也就是你现在看到的这个功能。</p>
+  </div>
+
+  <!-- ========== 小节 3 ========== -->
+  <div class="section" id="plan">
+    <h2>接下来学什么</h2>
+    <p>先把链接与路径这一章收干净：相对路径、绝对路径、页面内锚点、新窗口打开。</p>
+    <p>然后进入 CSS：把 &lt;style&gt; 从 head 里拆出去存成 .css 文件，让结构（HTML）和呈现（CSS）彻底分开。</p>
+    <p>再往后是盒模型和布局，那时候才谈得上"把页面排得好看"。</p>
+  </div>
+
+  <!-- ========== 页脚 ==========
+       它不只是装饰。浏览器滚动有物理上限：能滚到的最大位置 = 文档总高 − 视口高。
+       最后一节后面不留东西的话，"接下来学什么"永远滚不到视口顶端——
+       实测过：不加这段时它停在离顶 199px 的位置。 -->
+  <div class="footer" style="min-height: 45vh; padding: 24px 4px; text-align: center; color: #666;">
+    <p>© 张三 · 2026</p>
+    <p><a href="#about">回到顶部</a>（这同样是一个页面内锚点）</p>
+  </div>
+
+</body>
+</html>

@@ -11,6 +11,7 @@
 """
 
 from __future__ import annotations
+from src.silent import silent_kwargs
 
 import os
 import subprocess
@@ -580,6 +581,7 @@ def test_flatten_leaves_single_line_prompt_untouched():
     assert chat._flatten_for_cmd("  我的代码哪里不足？  ") == "我的代码哪里不足？"
 
 
+@pytest.mark.real
 @pytest.mark.skipif(os.name != "nt", reason="cmd.exe 的参数解析规则是 Windows 特有行为")
 def test_cmd_truncates_multiline_prompt_but_flatten_survives():
     """这个 bug 的**现场守卫**：cmd.exe 真的会切断多行参数，折行后才全须全尾。
@@ -598,6 +600,7 @@ def test_cmd_truncates_multiline_prompt_but_flatten_survives():
             text=True,
             encoding="utf-8",
             errors="replace",
+            **silent_kwargs(),
         )
         assert completed.returncode == 0, completed.stderr
         return int(completed.stdout.strip())
@@ -609,6 +612,7 @@ def test_cmd_truncates_multiline_prompt_but_flatten_survives():
     assert delivered_length(flattened) == len(flattened)
 
 
+@pytest.mark.real
 @pytest.mark.skipif(os.name != "nt", reason="npm shim 只在 Windows 上")
 def test_real_npm_shim_on_this_machine_resolves():
     """本机真 shim（若 dsh 是 npm 装的）必须解析得动；解析不动就会退回有截断风险的 cmd。"""

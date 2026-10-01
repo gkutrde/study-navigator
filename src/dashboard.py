@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import html
 import re
@@ -130,9 +131,22 @@ select:focus,input:focus{outline:2px solid var(--accent-weak); border-color:var(
 .chat-log{display:flex; flex-direction:column; gap:.5rem; max-height:22rem; overflow-y:auto; padding-right:.2rem}
 .chat-turn{display:flex; gap:.5rem; align-items:flex-start; font-size:.92rem}
 .chat-who{flex:0 0 3.2rem; color:var(--muted); font-size:.82rem; padding-top:.15rem}
+.chat-user{flex-direction:row-reverse}
+.chat-user .chat-who{text-align:right}
 .chat-user .chat-text{background:var(--accent-weak, #eef2ff); border-radius:8px; padding:.4rem .6rem}
+.chat-stamp{display:block; font-size:.72rem; color:var(--muted); margin-top:.1rem}
+.chat-thinking{margin-top:.35rem; font-size:.85rem}
+.chat-thinking summary{cursor:pointer; color:var(--muted)}
+.chat-thinking-body{margin-top:.3rem; padding:.5rem; background:var(--surface);
+  border:1px dashed var(--border); border-radius:8px; white-space:pre-wrap}
+.file-link{color:var(--accent); text-decoration:underline}
+.chat-markdown p{margin:.35rem 0}
+.chat-markdown table{border-collapse:collapse; margin:.4rem 0}
+.chat-markdown th,.chat-markdown td{border:1px solid var(--border); padding:.2rem .5rem}
 .chat-assistant .chat-text{background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:.4rem .6rem}
-.chat-text{white-space:pre-wrap; word-break:break-word; flex:1}
+.chat-text{white-space:pre-wrap; word-break:break-word; flex:0 1 auto; max-width:88%}
+.chat-user .chat-text{margin-left:auto}
+.chat-assistant .chat-text{margin-right:auto}
 .chat-form{display:flex; gap:.5rem; margin-top:.55rem}
 .chat-input{flex:1; padding:.5rem; border:1px solid var(--border); border-radius:8px; font-size:.92rem}
 .chat-inline-error{margin-top:.4rem; color:#a3302b; font-size:.85rem}
@@ -522,7 +536,46 @@ def _tokenize_table(lines: "list[str]", index: int) -> "tuple | None":
 
 
 FENCE = chr(96) * 3
+# T-037：在线查看的文本文件上限（防止把大文件灌进响应）
+MAX_SERVED_FILE_BYTES = 512 * 1024
+# 项目根的标志文件：往上找到含这些的目录就当项目根
+_PROJECT_MARKERS = ("README.md", ".git", "pyproject.toml", "setup.py")
+
+
+def _guess_project_root(profile_dir: Path) -> Path:
+    """从画像目录往上找项目根；找不到就用画像目录的上一级。"""
+    current = Path(profile_dir).resolve()
+    for _ in range(6):
+        if any((current / marker).exists() for marker in _PROJECT_MARKERS):
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return Path(profile_dir).resolve().parent
 TICK = chr(96)
+
+
+# 只把这些前缀下的路径变成可点链接（都在项目目录里，且端点还会再校验一次）
+LINKABLE_PREFIXES = ("profile/", "books/", "notes/", "src/", "tests/", "项目文档/")
+_PATH_LINK_RE = re.compile(
+    r"(?<![\w/.])((?:profile|books|notes|src|tests)/[\w\u4e00-\u9fff./\-]+\.\w+)"
+)
+
+
+def linkify_project_paths(html_text: str) -> str:
+    """把已经转义过的 HTML 里的项目内路径变成只读文件端点的链接。
+
+    只在**已转义**的文本上跑（所以不会误伤标签本身：转义后没有 "<" 了）。
+    """
+    def replace(match: re.Match) -> str:
+        raw = match.group(1)
+        if raw.startswith("../") or "/../" in raw:
+            return match.group(0)
+        href = "/file?path=" + html.escape(raw, quote=True)
+        return '<a class="file-link" href="' + href + '">' + raw + "</a>"
+
+    return _PATH_LINK_RE.sub(replace, html_text)
 
 
 def markdown_to_html(markdown: str) -> str:
@@ -749,6 +802,29 @@ ACTION_LABELS = {
     "explain": "讲解",
 }
 FIXED_ACTIONS = ("sync", "distill", "next", "done", "explain", "delete_task", "review", "handoff", "chat")
+
+# T-049 入口收敛：弹终端是**次级入口**，默认收起。
+# 讨论已经收敛到插件面板 + 原生会话（T-040/T-046），会弹黑框的那条路该默认关掉；
+# 想用的人显式开：DSH_TERMINAL_POPUP=1。
+TERMINAL_POPUP_ENV = "DSH_TERMINAL_POPUP"
+TRUTHY = ("1", "on", "true")
+
+# 任务卡上的「去 DSH 讨论」指引（单一来源，别在多处硬编码文案）
+DSH_DISCUSS_HINT = (
+    "💬 去 DSH 讨论：在 DSH 里打开「学习领航员」插件面板（对话输入框上方的「学习」按钮），"
+    "点这道题卡片上的「讨论」，就会在原生会话里带着本题上下文继续。"
+)
+
+
+def terminal_popup_enabled(environ=None) -> bool:
+    """弹终端按钮/动作是否启用。
+
+    默认**关**；只有环境变量 DSH_TERMINAL_POPUP 是明确真值才开。
+    =0 / 空串 / 未设置都算关（避免「设了个 0 反而打开」这种坑）。
+    """
+    source = os.environ if environ is None else environ
+    raw = str(source.get(TERMINAL_POPUP_ENV, "") or "").strip().lower()
+    return raw in TRUTHY
 STATUS_ACTION = "status"
 # 动作允许的入参键白名单：多给任何键一律拒绝（防止变成自由命令入口）
 ACTION_PARAM_KEYS = {
@@ -797,8 +873,19 @@ class TaskBoard:
     - 页面不提供任何任意命令输入框。
     """
 
-    def __init__(self, profile_dir: Path | str, *, operations: dict | None = None) -> None:
+    def __init__(
+        self,
+        profile_dir: Path | str,
+        *,
+        operations: dict | None = None,
+        project_root: Path | str | None = None,
+    ) -> None:
         self.profile_dir = Path(profile_dir)
+        # T-037：回答里的项目内路径要能点开。project_root 是**只读文件端点的白名单根**。
+        # 默认从画像目录往上找项目根（认 README.md / .git），而不是简单取 parent——
+        # 否则画像放在 profile/_xxx/ 这种子目录时，"profile/knowledge.md" 会解析到
+        # 项目外，端点直接 404（浏览器验收实测踩过）。
+        self.project_root = Path(project_root) if project_root else _guess_project_root(self.profile_dir)
         self.knowledge_path = self.profile_dir / "knowledge.md"
         self.tasks_path = self.profile_dir / "tasks.md"
         self.syllabus_path = self.profile_dir / "syllabus.md"
@@ -1141,11 +1228,44 @@ class TaskBoard:
 
     # --- 各页面 ---
 
+    def _recent_block(self) -> str:
+        """T-044：首页「最近 7 天」摘要卡——把周报的关键数字摆出来。"""
+        try:
+            from .report import collect_stats
+
+            stats = collect_stats(self.profile_dir, days=7, repo_root=self.project_root)
+        except Exception:
+            return ""
+
+        moved = stats["moved"]
+        tasks = stats["tasks"]
+        reviews = stats["review_tasks"]
+        done = stats["completed_reviews"]
+        fresh_weak = stats["fresh_weaknesses"]
+
+        rows = [
+            f"<li>知识点推进：<b>{len(moved)}</b> 个</li>",
+            f"<li>新增任务：<b>{len(tasks)}</b> 道（其中复习题 {len(reviews)} 道）</li>",
+            f"<li>复习完成：<b>{done}/{len(reviews)}</b></li>",
+            f"<li>薄弱点新增/复现：<b>{len(fresh_weak)}</b> 条</li>",
+        ]
+        if not (moved or tasks or fresh_weak):
+            rows.append('<li class="meta">最近 7 天没有活动。</li>')
+
+        return (
+            '<div class="card recent-card">'
+            "<h2>最近 7 天</h2>"
+            "<ul>" + "".join(rows) + "</ul>"
+            '<div class="meta">完整版：<code>python -m src.cli report --days 7</code></div>'
+            "</div>"
+        )
+
     def _home_page(self) -> str:
-        """首页只做概览：动作区 + 四态统计 + 最近一条任务，不把整份记录倒出来。"""
+        """首页只做概览：动作区 + 四态统计 + 最近 7 天 + 最近一条任务。"""
         profile = self._load_profile()
         records = self._task_records()
         sections = [self._toolbar(), self._stats(profile.counts())]
+        sections.insert(1, self._recent_block())
         sections.append(
             f'<p class="meta">画像 {len(profile.points)} 个知识点 ｜ 任务 {len(records)} 条 ｜ '
             f'<a href="/knowledge">看画像</a> · <a href="/tasks">看任务</a> · '
@@ -1237,16 +1357,63 @@ class TaskBoard:
             f'<textarea name="code" rows="4" placeholder="把代码粘在这里（也可以填本地路径，用 CLI：review {html.escape(record.when)} <文件>）"></textarea>'
             f'<button type="submit" class="btn-primary">提交作业</button>'
             f"</form>"
-            # T-031：把这道题的上下文交给 DSH 继续
-            f'<form method="post" action="/action/handoff" class="handoff-form">'
-            f'<input type="hidden" name="task" value="{html.escape(record.when)}">'
-            # 文案取 ACTION_LABELS（单一来源），避免改了标签忘了按钮
-            f'<button type="submit" class="btn-secondary">{html.escape(ACTION_LABELS["handoff"])}</button>'
-            f"</form>"
+            # T-049：默认收起弹终端按钮（DSH_TERMINAL_POPUP=1 才显示）
+            f"{self._handoff_form(record)}"
+            # T-049：无论显不显示终端按钮，都给出「去 DSH 讨论」的指引
+            f'<div class="dsh-hint">{html.escape(DSH_DISCUSS_HINT)}</div>'
             # T-034：**主入口**——卡片下方面板里直接连续对话
             f"{self._chat_panel(record)}"
             f'<div class="inline-error" hidden></div>'
             "</div>"
+        )
+
+    def _handoff_form(self, record) -> str:
+        """T-049：弹终端表单——默认不渲染，DSH_TERMINAL_POPUP=1 才给。"""
+        if not terminal_popup_enabled():
+            return ""
+        return (
+            '<form method="post" action="/action/handoff" class="handoff-form">'
+            f'<input type="hidden" name="task" value="{html.escape(record.when)}">'
+            # 文案取 ACTION_LABELS（单一来源），避免改了标签忘了按钮
+            f'<button type="submit" class="btn-secondary">{html.escape(ACTION_LABELS["handoff"])}</button>'
+            "</form>"
+        )
+
+    def _chat_turn(self, turn) -> str:
+        """渲染一轮对话。
+
+        T-037：**回答渲染 markdown，用户输入只转义**。
+        这是有意的差别——回答是模型产出、我们想让它好看；用户输入是注入面，必须原样显示。
+        """
+        who = "你" if turn.role == "user" else "DSH"
+        if turn.role == "user":
+            body = '<div class="chat-text chat-plain">' + html.escape(turn.text) + "</div>"
+        else:
+            body = (
+                '<div class="chat-text chat-markdown">'
+                + linkify_project_paths(markdown_to_html(turn.text))
+                + "</div>"
+            )
+        stamp = (
+            f'<span class="chat-stamp">{html.escape(turn.at)}</span>'
+            if getattr(turn, "at", "")
+            else ""
+        )
+        # T-037：思考过程默认折叠（<details> 不带 open），想看再点开
+        thought = str(getattr(turn, "thinking", "") or "").strip()
+        folded = ""
+        if thought:
+            folded = (
+                '<details class="chat-thinking">'
+                "<summary>思考过程</summary>"
+                '<div class="chat-thinking-body">'
+                + html.escape(thought)
+                + "</div></details>"
+            )
+        return (
+            f'<div class="chat-turn chat-{html.escape(turn.role)}">'
+            f'<span class="chat-who">{html.escape(who)}{stamp}</span>'
+            f"{body}{folded}</div>"
         )
 
     def _chat_panel(self, record) -> str:
@@ -1258,12 +1425,7 @@ class TaskBoard:
         except Exception:
             turns = []
 
-        log = "".join(
-            f'<div class="chat-turn chat-{html.escape(turn.role)}">'
-            f'<span class="chat-who">{html.escape("你" if turn.role == "user" else "DSH")}</span>'
-            f'<div class="chat-text">{html.escape(turn.text)}</div></div>'
-            for turn in turns
-        )
+        log = "".join(self._chat_turn(turn) for turn in turns)
         return (
             f'<div class="chat-panel" id="chat-panel" data-chat-task="{html.escape(record.when)}">'
             f'<button type="button" class="btn-chat-toggle" data-chat-toggle>'
@@ -1365,6 +1527,11 @@ class Dashboard:
             return 405, "text/plain; charset=utf-8", "只支持 GET/HEAD"
 
         route = (path or "/").split("?", 1)[0].strip("/")
+
+        # T-037：只读文件端点（回答里的项目内路径要能点开）
+        if route == "file":
+            return self._serve_project_file(path or "")
+
         if self.board is not None:
             pages = self.board.pages()
         else:
@@ -1374,6 +1541,56 @@ class Dashboard:
         return 404, "text/html; charset=utf-8", render_page(
             "404", "<p>页面不存在。</p><p><a href=\"/\">回首页</a></p>"
         )
+
+    def _serve_project_file(self, path: str) -> tuple[int, str, str]:
+        """只读地吐一个项目内文件。
+
+        安全边界（这是新增的读接口，必须自己守住）：
+        - 只接受**相对路径**，绝对路径一律拒（否则 C:/Windows/... 能读）；
+        - 归一化后必须仍在 project_root 之内（挡 ".." 穿越）；
+        - 只吐文本，体积上限防止把大文件灌进响应。
+        """
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        query = parse_qs(urlparse(path).query)
+        raw = (query.get("path") or [""])[0]
+        raw = unquote(str(raw)).strip()
+        if not raw:
+            return 400, "text/plain; charset=utf-8", "缺少 path 参数"
+
+        # 拒绝绝对路径与盘符（Windows 的 C:/... 与 POSIX 的 /etc/...）
+        candidate = Path(raw.replace("\\", "/"))
+        if candidate.is_absolute() or re.match(r"^[A-Za-z]:", raw) or raw.startswith(("/", "\\")):
+            return 400, "text/plain; charset=utf-8", "只允许项目内的相对路径"
+
+        root = (
+            self.board.project_root
+            if self.board is not None
+            else self.profile_dir.parent
+        )
+        try:
+            root_real = root.resolve()
+            target = (root_real / candidate).resolve()
+        except OSError:
+            return 400, "text/plain; charset=utf-8", "路径无法解析"
+
+        # resolve 之后再用 relative_to 判定，符号链接也会被这一步挡下
+        try:
+            target.relative_to(root_real)
+        except ValueError:
+            return 400, "text/plain; charset=utf-8", "路径越界：只允许项目目录内"
+
+        if not target.is_file():
+            return 404, "text/plain; charset=utf-8", "文件不存在"
+
+        try:
+            if target.stat().st_size > MAX_SERVED_FILE_BYTES:
+                return 400, "text/plain; charset=utf-8", "文件过大，暂不支持在线查看"
+            body = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return 400, "text/plain; charset=utf-8", "文件读取失败"
+
+        return 200, "text/plain; charset=utf-8", body
 
     def _handle_action_json(self, action: str, body: bytes | None) -> tuple[int, str, str]:
         """JSON 动作接口：只认白名单动作与白名单键；成功回 {ok, output}（status 另带计数）。"""

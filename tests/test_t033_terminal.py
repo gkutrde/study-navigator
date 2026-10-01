@@ -52,11 +52,13 @@ def test_build_chat_command_line_has_module_and_timestamp():
     assert line.index("chat") < line.rindex("2026-09-27 10:00")
 
 
-def test_build_chat_command_line_includes_first_question():
+def test_build_chat_command_line_has_no_first_question():
+    """T-036 起相反：命令里**不能**再有首问，否则跑的是单次模式。"""
     line = build_chat_command_line("python", "2026-09-27 10:00")
 
-    assert FIRST_QUESTIONS[0] in line
-    assert "我的代码哪里不足" in line
+    assert FIRST_QUESTIONS[0] not in line
+    assert "我的代码哪里不足" not in line
+    assert line.strip().endswith('"2026-09-27 10:00"'), "命令应停在时间戳上（进交互模式）"
 
 
 def test_build_chat_command_line_quotes_spaced_executable():
@@ -191,10 +193,15 @@ def make_board(tmp_path, directory):
     )
 
 
-def test_handoff_button_says_terminal(tmp_path):
-    """按钮文案改成「在 DSH 中继续（弹终端）」。"""
+def test_handoff_button_says_terminal(tmp_path, monkeypatch):
+    """按钮文案是「在 DSH 中继续（弹终端）」。
+
+    T-049 起这个按钮**默认不显示**，只有 DSH_TERMINAL_POPUP=1 才出现，
+    所以这条要先打开开关——文案契约本身没变。
+    """
     from src.dashboard import TaskBoard
 
+    monkeypatch.setenv("DSH_TERMINAL_POPUP", "1")
     directory = make_directory(tmp_path)
     page = TaskBoard(directory).pages()["tasks"]
 
@@ -202,9 +209,11 @@ def test_handoff_button_says_terminal(tmp_path):
 
 
 def test_handoff_action_tries_to_launch_terminal(tmp_path, monkeypatch):
+    """开了开关才弹终端（T-049 入口收敛：默认不弹）。"""
     import src.cli as cli
     import src.terminal as terminal
 
+    monkeypatch.setenv("DSH_TERMINAL_POPUP", "1")
     directory = make_directory(tmp_path)
     board = make_board(tmp_path, directory)
     seen = {}
@@ -316,3 +325,134 @@ def test_start_argv_quotes_spaced_python_in_command_line(monkeypatch):
 
     command = argv[-1]
     assert command.startswith('"C:\\Program Files\\Python\\python.exe"'), command
+
+# ---------- T-036：弹窗要走交互模式（REPL），不再拼 question ----------
+
+
+def test_popup_command_line_has_no_question_argument():
+    """根因回归：弹窗命令不能再无条件拼 question（那是单次模式）。"""
+    line = build_chat_command_line("python", "2026-09-27 10:00")
+
+    assert "我的代码哪里不足" not in line, "弹窗不该把首问当成参数传进去"
+    assert "chat" in line
+    assert "2026-09-27 10:00" in line
+
+
+def test_popup_command_line_ignores_question_param():
+    """即使调用方传了 question，弹窗命令也不带它（改由 REPL 内部预发）。"""
+    line = build_chat_command_line("python", "2026-09-27 10:00", "随便一个问题")
+
+    assert "随便一个问题" not in line
+
+
+def test_popup_start_argv_also_drops_question():
+    argv = build_start_argv("python", "2026-09-27 10:00", "另一个问题")
+
+    assert "另一个问题" not in " ".join(argv)
+    assert argv[5] == "/k"
+
+
+def test_popup_command_still_quotes_spaced_python():
+    line = build_chat_command_line(r"C:\Program Files\Python\python.exe", "2026-09-27 10:00")
+
+    assert line.startswith('"C:\\Program Files\\Python\\python.exe"')
+
+
+def test_popup_command_keeps_profile_when_given():
+    line = build_chat_command_line("python", "2026-09-27 10:00", profile_path="C:\\my dir\\k.md")
+
+    assert "--profile" in line
+    assert '"C:\\my dir\\k.md"' in line
+
+
+# ---------- REPL 启动预发第一条引导提问 ----------
+
+
+def test_repl_pre_sends_initial_question():
+    """弹窗里要"打开就有一条回答"，靠 REPL 启动时预发首问。"""
+    from src import repl
+
+    asked = []
+    out = []
+    lines = iter([])
+
+    def reader(prompt):
+        try:
+            return next(lines)
+        except StopIteration:
+            raise EOFError
+
+    code = repl.run_repl(
+        ask=lambda text: asked.append(text) or "回答：" + text,
+        read_line=reader,
+        write=out.append,
+        initial="我的代码哪里不足？",
+    )
+
+    assert code == 0
+    assert asked == ["我的代码哪里不足？"], "启动时应自动问一次"
+    assert any("回答：我的代码哪里不足？" in str(x) for x in out)
+
+
+def test_repl_without_initial_asks_nothing():
+    from src import repl
+
+    asked = []
+    lines = iter([])
+
+    def reader(prompt):
+        try:
+            return next(lines)
+        except StopIteration:
+            raise EOFError
+
+    repl.run_repl(ask=lambda t: asked.append(t) or "答", read_line=reader, write=lambda x: None)
+
+    assert asked == []
+
+
+def test_repl_initial_failure_does_not_kill_loop():
+    """首问失败也要进循环，让用户能重试或换问题。"""
+    from src import repl
+
+    calls = []
+    out = []
+    lines = iter(["再问一次"])
+
+    def reader(prompt):
+        try:
+            return next(lines)
+        except StopIteration:
+            raise EOFError
+
+    def ask(text):
+        calls.append(text)
+        if len(calls) == 1:
+            raise RuntimeError("首问失败")
+        return "第二次成功"
+
+    code = repl.run_repl(ask=ask, read_line=reader, write=out.append, initial="第一条")
+
+    assert code == 0
+    assert calls == ["第一条", "再问一次"]
+    assert any("首问失败" in str(x) for x in out)
+    assert any("第二次成功" in str(x) for x in out)
+
+
+def test_repl_initial_still_exits_on_quit():
+    from src import repl
+
+    calls = []
+    lines = iter(["quit"])
+
+    def reader(prompt):
+        try:
+            return next(lines)
+        except StopIteration:
+            raise EOFError
+
+    code = repl.run_repl(ask=lambda t: calls.append(t) or "答", read_line=reader,
+                         write=lambda x: None, initial="第一条")
+
+    assert code == 0
+    assert calls == ["第一条"], "quit 不该再问"

@@ -14,3 +14,8 @@ _*.png
 check-card*
 console-check.js
 verify.bat
+
+# 提示词与任务卡：不上传（由作者私下分发）
+项目文档/06-AI新项目启动提示词.md
+项目文档/任务卡-*.md
+_verify/

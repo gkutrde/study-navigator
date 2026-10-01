@@ -167,6 +167,21 @@ def test_handoff_includes_submitted_code_when_present(tmp_path):
 
 
 def test_task_card_has_handoff_button(tmp_path):
+    """T-049 后：按钮**默认不显示**，但仍要有「去 DSH 讨论」的指引。
+
+    原断言（默认就能看到按钮）已按新契约更新——不是把测试删掉，
+    而是把「按钮在」换成「指引在」，并另开一条测开关打开后的按钮。
+    """
+    directory = make_directory(tmp_path)
+    page = TaskBoard(directory).pages()["tasks"]
+
+    assert 'action="/action/handoff"' not in page, "默认不该有弹终端表单"
+    assert "去 DSH 讨论" in page, "要有指向插件面板的指引"
+
+
+def test_task_card_has_handoff_button_when_enabled(tmp_path, monkeypatch):
+    """开了 DSH_TERMINAL_POPUP=1，T-031 原来的行为要完整回来。"""
+    monkeypatch.setenv("DSH_TERMINAL_POPUP", "1")
     directory = make_directory(tmp_path)
     page = TaskBoard(directory).pages()["tasks"]
 
@@ -175,8 +190,12 @@ def test_task_card_has_handoff_button(tmp_path):
     assert 'name="task"' in page
 
 
-def test_handoff_button_sits_near_submit(tmp_path):
-    """按钮要出现在任务卡片里（提交作业附近），不是在顶部动作区。"""
+def test_handoff_button_sits_near_submit(tmp_path, monkeypatch):
+    """按钮要出现在任务卡片里（提交作业附近），不是在顶部动作区。
+
+    T-049 起按钮默认收起，所以这里显式打开开关再验位置。
+    """
+    monkeypatch.setenv("DSH_TERMINAL_POPUP", "1")
     directory = make_directory(tmp_path)
     page = TaskBoard(directory).pages()["tasks"]
 

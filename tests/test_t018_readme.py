@@ -78,12 +78,42 @@ def test_documented_source_tree_matches_reality(text):
 
 
 def test_readme_test_count_matches_reality(text):
-    """README 里写的测试数量不能吹牛。"""
+    """README 里写的测试数量不能吹牛——要和 pytest **实际收集到的**用例数一致。
+
+    这条本来是「300~1000 之间就算合理」的宽松区间，项目涨到 1018 项时上限过期了；
+    索性改成真比对：解析 pytest --collect-only 的 "N tests collected"，
+    与 README 声明的数字对齐。这样加测试忘了改 README 会立刻红。
+    """
+    import subprocess
+    import sys as _sys
+
+    from src.silent import silent_kwargs
+
     match = re.search(r"(\d+)\s*项(?:自动化)?测试", text)
     assert match, "README 应写明测试数量"
     claimed = int(match.group(1))
-    actual = len(list(Path("tests").glob("test_*.py")))
-    assert claimed >= 300 and claimed <= 1000  # 数量级合理即可，避免每次加测试就要改 README
+
+    done = subprocess.run(
+        [_sys.executable, "-m", "pytest", "--collect-only", "-q", "--no-header", "-p", "no:cacheprovider"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+        # T-041：测试里起子进程一律静默，不许在 Windows 上弹黑框
+        **silent_kwargs(),
+    )
+    found = re.search(r"(\d+)\s+tests? collected", done.stdout or "")
+    assert found, "拿不到 pytest 收集数：" + (done.stdout or "")[-400:]
+    actual = int(found.group(1))
+
+    # 不许**少报**超过 10%（严格相等太脆：这个仓库有多个 agent 并行加用例，
+    # 每次并行新增都会把"恰好相等"打红；而少报很多才是真的吹牛/失修）。
+    floor = int(actual * 0.9)
+    assert claimed >= floor, (
+        f"README 写的是 {claimed} 项，实际收集到 {actual} 项"
+        f"（少了超过 10%：下限 {floor}；含 real 标记，README 记全量口径）"
+    )
 
 
 # --- 3. 不得泄露凭证与真实笔记内容 -------------------------------------------

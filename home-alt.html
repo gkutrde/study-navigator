@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>张三的主页 | home-alt.html（档 2：div + span 版，Head First 第 11 章路线）</title>
+  <style>
+    /* 这一档不用 HTML5 语义标签，只用这本书里真讲过的 <div> / <span> 来分块。
+       为什么留这一档：Head First HTML and CSS 第 2 版（2005–2006）全书没有
+       header/nav/main/aside/footer —— 书里能查到的"把页面按逻辑分块"只有 div + class。
+       所以这份文件是"书的第 11 章能带你走到哪里"的实物证据；五个语义标签要看 MDN。 */
+
+    .block { padding: 14px 20px; border: 2px solid #8a8a8a; border-top: 0; }
+    .block-first { border-top: 2px solid #8a8a8a; }
+
+    #page-header { background-color: #f7e6e6; }   /* 1 页头 · 浅粉 */
+    #page-nav    { background-color: #e3eef7; }   /* 2 导航 · 浅蓝 */
+    #page-main   { background-color: #e9f5e4; }   /* 3 主内容 · 浅绿 */
+    #page-aside  { background-color: #fbf4dc; }   /* 4 侧栏 · 浅黄 */
+    #page-footer { background-color: #ece8f7; }   /* 5 页脚 · 浅紫 */
+
+    .sep { color: #8a8a8a; }                      /* 导航里那几个分隔用的 span */
+    .tag-name { font-family: Consolas, monospace; color: #a33; }
+    img { border: 1px dashed #8a8a8a; }
+    body { margin: 0; font-family: system-ui, "Microsoft YaHei", sans-serif; line-height: 1.7; }
+  </style>
+</head>
+<body>
+
+  <!-- 五个块全是 div，靠 id 区分。语义标签版请见 home.html / home-min.html。 -->
+
+  <!-- ===== 1 页头 ===== -->
+  <div id="page-header" class="block block-first">
+    <h1>张三的主页</h1>
+    <p>页头：<span class="tag-name">&lt;div id="page-header"&gt;</span> 顶上来的，不是 <span class="tag-name">&lt;header&gt;</span>。</p>
+    <img src="avatar.jpg" alt="张三的头像" width="120" height="120">
+  </div>
+
+  <!-- ===== 2 导航 ===== -->
+  <div id="page-nav" class="block">
+    <a href="#home">首页</a>
+    <span class="sep">|</span>
+    <a href="#blog">日志</a>
+    <span class="sep">|</span>
+    <a href="#photo">相册</a>
+    <span class="sep">|</span>
+    <a href="#about">关于我</a>
+  </div>
+
+  <!-- ===== 3 主内容 ===== -->
+  <div id="page-main" class="block">
+    <h2>三段短文</h2>
+
+    <p>第一段：同样是五个分色区块，这一档全部由 div 承担。浏览器看来它们都是"没有语义的块级盒子"，样式照样生效，只是屏幕阅读器读不出"这块是导航、那块是页脚"。</p>
+
+    <p>第二段：这就是语义标签存在的理由 —— <span class="tag-name">&lt;nav&gt;</span> 和 <span class="tag-name">&lt;div id="page-nav"&gt;</span> 在屏幕上可以长得一模一样，但对搜索引擎和无障碍工具的含义完全不同。</p>
+
+    <p>第三段：内联元素 span 不会另起一行，所以上面那几段里的标签名能和文字排在同一行里；div 是块级元素，一定独占一行。这条区别是 Head First 第 3 章讲透的。</p>
+
+    <img src="photo.jpg" alt="主页封面图（src 指向的文件不存在时，这段字会顶上来）" width="240" height="160">
+  </div>
+
+  <!-- ===== 4 侧栏 ===== -->
+  <div id="page-aside" class="block">
+    <h2>链接列表</h2>
+    <ul>
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML/Element/div">MDN：div 块级分组</a></li>
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML/Element/span">MDN：span 内联分组</a></li>
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML/Element/header">MDN：header 页头（书里没有）</a></li>
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML/Element/nav">MDN：nav 导航（书里没有）</a></li>
+      <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML/Element/aside">MDN：aside 侧栏（书里没有）</a></li>
+    </ul>
+
+    <h3>顺带复习一下有序列表</h3>
+    <ol>
+      <li>先打 ! 生成文档骨架</li>
+      <li>再摆五个区块</li>
+      <li>最后给每块加底色</li>
+    </ol>
+  </div>
+
+  <!-- ===== 5 页脚 ===== -->
+  <div id="page-footer" class="block">
+    <p>© 张三 · 2026-09-29 · 用 HTML 手写</p>
+  </div>
+
+</body>
+</html>
