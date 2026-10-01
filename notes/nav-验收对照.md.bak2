@@ -1,0 +1,241 @@
+# nav.html 验收对照（导航 + 页内锚点）
+
+- 任务：顶部一条导航（3~4 个链接），点链接跳到页面内对应小节
+- 提交版（接力上下文「本次提交的代码」，11 字符，未截断）：
+
+```html
+<h1>张三</h1>
+```
+
+- 判分脚本：`verify-nav.js`（真 Chrome 打开、真点链接、真量 `window.scrollY`，不是肉眼判断）
+- 环境：Windows 11 + node + playwright（`channel: "chrome"`, viewport 1280×800）
+- 本轮新增文件（git 里全是 `??` 未跟踪，没有覆盖任何既有文件）：`nav-min.html`、`nav.html`、`nav-alt.html`、`verify-nav.js`
+
+## 一句话结论
+
+**提交的 11 字符只提供了一行标题。验收方式 3 条：0 PASS / 3 FAIL；实现要点 4 条：0 命中 / 4 缺失。**
+
+它不是「写错了」，是「还没写」——页面上没有导航、没有锚点、没有第二个链接、没有任何属性，连一个可以挑语法错的地方都没有。所以下面的「最小修改」不是打补丁，是把你那一行**前后各包一段**。
+
+## 表 A：验收方式原文（这一栏才决定过不过）
+
+| # | 验收方式原文 | 提交版 | 判定依据（代码层） | 最小修改 |
+|---|---|---|---|---|
+| 1 | 点导航每一项，页面都滚到对应小节 | **FAIL** | `document.querySelectorAll(".nav a")` 返回空；`div[id]` 一个都不存在；页面高度 ≈ 一个标题，`window.scrollY` 永远是 0 | 3 个 `<a href="#about\|#skills\|#plan">` + 3 个 `<div id="about\|skills\|plan">`，且每节要够高（见下方「暗坑」） |
+| 2 | 外部链接在新标签页打开 | **FAIL** | 全页只有一个 `<h1>`，没有第二个 `<a>`，没有任何 `target` | 第 4 个 `<li>` 里放外站链接：`<a href="https://..." target="_blank">` |
+| 3 | 查看元素能确认 `id` 与 `href` 一一对应 | **FAIL** | 两边都不存在，无从对应。脚本实测：`idExists` 列全空 | `href` 去掉 `#` 之后的字符串，必须和某个 `id` **逐字**（含大小写、连字符）一致 |
+
+## 表 B：实现要点 4 条
+
+| # | 要点原文 | 提交版 | 说明 |
+|---|---|---|---|
+| 1 | 每个小节用 `<div id="...">` 起锚点，导航写 `<a href="#该 id">` | 缺 | 锚点的本质：`id` 是目标，`href="#目标"` 是发射；两者靠**字符串相等**连接，浏览器不做模糊匹配 |
+| 2 | 导航本身用 `<ul><li>` 排成一行 | 缺 | **这条是本次的真考点**：`ul`/`li` 默认是块级、竖着一列，光写 `ul/li` 得到的是一列而不是一行。变一行必须靠 CSS（`display: inline-block`，或 `float`）——见「知识点落点」 |
+| 3 | 一个链接指向外部网站，`target="_blank"` | 缺 | 顺手写 `rel="noopener"`：不加的话新页面能通过 `window.opener` 反过来操纵本页 |
+| 4 | 用 `style` 属性把导航背景改成喜欢的颜色 | 缺 | 提交版里**一个属性都没有**。本次选的是暖黄 `#ffe9b3`（实测计算值 `rgb(255, 233, 179)`） |
+
+## 最小修改：三档，按你要过哪一关选
+
+三档都已落盘、都已实跑过验收，任选一份覆盖你的 `nav.html` 就能过。
+
+### 档 0 —— 只求过验收（`nav-min.html`，46 行）
+
+起点就是你那一行，所有样式走 `style` 属性，不写一个选择器。骨架顺序：
+
+```html
+<div class="nav" style="background-color: #ffe9b3; padding: 10px 14px;">
+  <ul style="list-style: none; margin: 0; padding: 0;">
+    <li style="display: inline-block; margin-right: 20px;"><a href="#about">关于我</a></li>
+    <li style="display: inline-block; margin-right: 20px;"><a href="#skills">我会什么</a></li>
+    <li style="display: inline-block; margin-right: 20px;"><a href="#plan">接下来学什么</a></li>
+    <li style="display: inline-block; margin-right: 20px;"><a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML" target="_blank" rel="noopener">MDN 文档（外部）</a></li>
+  </ul>
+</div>
+
+<h1>张三</h1>                       <!-- ← 你原来的那一行，原样保留 -->
+
+<div id="about"  style="min-height: 80vh; ...">…</div>
+<div id="skills" style="min-height: 80vh; ...">…</div>
+<div id="plan"   style="min-height: 80vh; ...">…</div>
+<div style="height: 40vh;"></div>    <!-- ← 不是装饰，见「暗坑」 -->
+```
+
+### 档 1 —— 有点代码洁癖（`nav.html`，68 行）
+
+把 `display`/`margin`/`min-height` 这些挪进 `<head>` 的 `<style>` 块，用 `.nav li`、`.section` 两个选择器管住；导航背景色仍然按要求用 `style` 属性写。好处：改一处、三处生效。附了逐段中文注释。
+
+### 档 2 —— 对照实验（`nav-alt.html`，44 行）
+
+整页不写 `<style>` 块，**全部**样式走 `style` 属性，用来验证「要点 4 只要求你会用 `style` 属性，不要求你先会写选择器」。代价也很直观：`display: inline-block` 在 4 个 `li` 上各抄了一遍，改一次要改四处——这就是书的第 8 章为什么要你学选择器。
+
+## 一个卡「验收 1」的暗坑（不写就白写）
+
+**浏览器能滚到的最大位置 = 文档总高 − 视口高。** 物理上限，不是 bug。
+
+三个小节如果把内容写得很短，页面总高不比视口高多少，点第 3 个链接时浏览器**已经滚到底了、没法再滚**——小节顶部停在离视口顶一百多像素的位置，看起来就像「跳错地方了」或「没跳」。
+
+本仓库实测记录（写在 `nav.html` 的页脚注释里）：最后一节后面不留东西时，「接下来学什么」停在离视口顶 **199px**，达不到「滚到对应小节」的验收标准。两种修法：
+
+1. 每节给高度：`min-height: 70~80vh`（档 0 档 1 都用这招）；
+2. 末尾留空白：`<div style="height: 40vh;"></div>`（档 0 用的）。
+
+## 知识点落点自查（用到的 4 项）
+
+| 知识点 | 你这页里具体落在哪 |
+|---|---|
+| 超链接 `a`（`href`/`target`） | `href="#about"` 指页内锚点；`href="https://…" target="_blank"` 指外站并开新标签 |
+| 列表 `ul`/`ol`/`li` | 导航用 `<ul>` + 4 个 `<li>`；`list-style: none` 去圆点、`margin/padding: 0` 去缩进 |
+| 块元素与行内元素 | `div` 各占一整行（导航条、三个小节）；`span` 在段落里做局部标记不换行；`li` 加 `display: inline-block` 是从「块级」掰成「同一行」的那一步 |
+| HTML 属性（`class`/`id`/`style`） | `class="nav"` 给导航一个可被选择器选中的名字；`id="about"` 当锚点目标；`style="background-color: #ffe9b3"` 上色 |
+
+## 实跑证据（本轮三份全跑过）
+
+`node verify-nav.js <文件>`：
+
+| 文件 | 验收1 三个锚点 | 验收2 新标签页 | 验收3 id/href 对应 | 要点2 一行 | 要点4 背景色 | pageerror |
+|---|---|---|---|---|---|---|
+| `nav-min.html` | 3/3 PASS（scrollY 134 / 807 / 1480，hits 时小节顶到视口顶） | PASS（弹出新标签，原页未关） | 3/3 `idExists: true` | `liTops: [18,18,18,18]` → true | `rgb(255, 233, 179)` | 无 |
+| `nav.html` | 3/3 PASS（49 / 642 / 1235） | PASS | 3/3 true | true | `rgb(255, 233, 179)` | 无 |
+| `nav-alt.html` | 3/3 PASS（49 / 642 / 1235） | PASS | 3/3 true | true | `rgb(255, 233, 179)` | 无 |
+
+截图：`_nav_top.png`、`_nav_after_click.png`、`_nav-min_top.png`、`_nav-min_after_click.png`。
+
+「查看元素」的人工版做法：F12 → Elements → 点导航里的 `<a>`，读它的 `href` 值 → `Ctrl+F` 搜 `id="about"`，能搜到就是一一对应。
+
+## 书籍章节（把任务卡第 4 段那个空填上）
+
+主用书：**《Head First HTML 与 CSS（第 2 版）》**，Elisabeth Freeman & Eric Freeman，O'Reilly（中文版由中国电力出版社出版）。
+
+工作区里已有蒸馏稿 `books/蒸馏-HeadFirst-HTML-CSS-2e.md`；下面「书页」栏的页码来自原书文末索引（`books/_src/head-first-html-css.txt` 第 27800 行往后），不是估计值。
+
+| 知识点 | 第几章（书里原名） | 书页 | 重点看 | 跳过 |
+|---|---|---|---|---|
+| 超链接 `a` / `href` / `target` | 第 2 章 *Meet the 'HT' in HTML: going further, with hypertext*（`<a>` 与 `href`、属性语法）；第 4 章 *A Trip to Webville: getting connected*（目标锚点、新窗口） | 锚点 **151–155**；`target` 新窗口 **157–159**（索引另收 `launching new window 158`） | 第 2 章：属性写法 `属性名="属性值"`、值**必须**用双引号包住、不能自造属性（`href` 属于 `<a>`，`type` 属于 `<style>`）；第 4 章：`#` + 目标 `id` 指到页内某处，以及「一堆页面时锚点才有意义」这段动机 | 第 2 章的相对路径整段（`../` 向上、子目录向下）——留到做多文件站点时再看；第 4 章的托管公司 / 域名 / FTP / 默认页 index.html 全部跳过，与本次目标无关 |
+| 列表 `ul`/`ol`/`li` | 第 3 章 *Web Page Construction: building blocks* | **105–108** | `<ul>` 配 `<li>`、`<ol>` 配 `<li>`；列表里能嵌套列表；「构造 HTML 列表只需两步」那段 | 第 13 章 *tables and lists* 里的表格（`<table>/<tr>/<th>/<td>`）与 `list-style-type` 细节——那是后面的美化阶段 |
+| 块元素 / 行内元素 | 第 3 章（内联 vs 块级） | **94–97**；章末 bullet 汇总 **117** | 「块级元素各占一整行、内联元素在同一行里从左到右流」——这就是「`ul/li` 为什么默认竖着排、必须 `display: inline-block` 才能横过来」的答案。这一段是后面盒模型和布局的地基 | 第 12 章 *layout and positioning* 的 `float`/`position`/`z-index`（488–494、513 页）——现在去啃会被淹，等学完盒模型再来 |
+| `div` / `span` | 第 11 章 *Advanced Web Construction: divs and spans* | **433 页起**（把页面按逻辑分块）；**464 页**（三步加入 `<span>`） | `div` 是分块的钢梁（导航条、正文区各一块）；`span` 是行内的小范围标记，只圈几个字、不换行 | 第 11 章后半的伪类（`a:link`/`a:visited`）、层叠（cascade）、特异性（468–475 页）——那是 CSS 阶段的硬骨头，现在看只会糊 |
+| 属性 `class` / `id` / `style` | 属性语法：第 2 章（紧跟 `<a>`/`href` 之后那一节，蒸馏稿 txt 行 3126–3199）；`class` vs `id`：第 10 章 *the box model* | `id` 与 `href` 的关系 **155**；`class` vs `id` **416–419** | `class` 给「可能复用」的样式（`class="nav"`），`id` 给「页面上只有一个」的元素（`id="about"`）——也正因为它唯一，才能当锚点目标；`id` 必须以字母开头，一个元素只能有一个 `id`，但可以同属多个 `class` | **书里没把 `style` 属性当推荐写法**。Head First 全书主张结构与呈现分离（第 1 章：HTML 管结构、CSS 管表现，别用一种语言干两件事），正规写法是把样式写进 `<head>` 的 `<style>` 或外部 `.css`。所以「用 `style` 属性上色」是**本次作业的简化要求**，照做，但别把它当成书的规矩记下来——第 8 章 *getting started with CSS* 就是来接管这件事的 |
+
+学习顺序建议（按需看的先后，不是页码顺序）：**第 2 章属性小节 → 第 4 章 151–155 锚点 + 157–159 target → 第 3 章 94–97 与 105–108 → 第 11 章 433/464 页的 div/span**。第 10 章的 `class` vs `id`（416–419）可以现在扫一眼，正式学留给盒模型那一轮。
+
+## 回滚
+
+三份 HTML 与脚本都是本轮新增（`git status` 显示 `??`），没覆盖任何既有文件，所以回滚 = 删掉：
+
+```powershell
+Remove-Item nav-min.html, nav.html, nav-alt.html, verify-nav.js -ErrorAction SilentlyContinue
+Remove-Item _nav_top.png, _nav_after_click.png, _nav-min_top.png, _nav-min_after_click.png -ErrorAction SilentlyContinue
+```
+
+只删演示文件、想留下自己的版本：反向操作，`Copy-Item nav-min.html nav.html -Force`。
+
+## 本轮复核（新窗口重开这一题，2026-09-29）
+
+`node verify-nav.js nav-min.html` 与 `node verify-nav.js nav.html` 各复跑一次，结论与上表一致，无变化：
+
+| 文件 | 验收1 | 验收2 | 验收3 | 要点2 一行 | 要点4 背景色 | pageerror |
+|---|---|---|---|---|---|---|
+| `nav-min.html` | 3/3 PASS（scrollY 134 / 807 / 1480，小节顶部距视口 0px） | PASS | 3/3 true | `liTops [18,18,18,18]` | `rgb(255,233,179)` | 无 |
+| `nav.html` | 3/3 PASS（49 / 642 / 1235，距视口 0px） | PASS | 3/3 true | `liTops [18,18,18,18]` | `rgb(255,233,179)` | 无 |
+
+命令行版「查看元素」（不装任何工具，PowerShell 原生）：
+
+```powershell
+$t = Get-Content nav.html -Raw
+$hrefs = [regex]::Matches($t,'href="#([^"]+)"') | % { $_.Groups[1].Value }
+$ids   = [regex]::Matches($t,'id="([^"]+)"')   | % { $_.Groups[1].Value }
+foreach ($h in $hrefs) { "{0,-10} -> id存在? {1}" -f ("#"+$h), ($ids -contains $h) }
+```
+
+**踩坑提醒**：正则会把注释里那句「`href` 里的 `#xxx` 必须和下面小节的 `id="xxx"` 一模一样」也匹配进来，输出里会出现一个不存在的 `id="xxx"`。那行是注释，不是元素——看回包时要认出来。真正参与对应的是：`#about/#skills/#plan` ↔ `id="about"/"skills"/"plan"`（外加页脚那个「回到顶部」的 `href="#about"` 复用同一个 id）。
+
+## 书籍章节：精确到工作区里的行号（可 Ctrl+G 直达）
+
+主用书仍是 **《Head First HTML 与 CSS（第 2 版）》**。工作区里三份材料各有用处：
+
+- 快速读：`books/蒸馏-HeadFirst-HTML-CSS-2e.md`
+- 查原话：`books/_src/head-first-html-css.txt`（29,395 行，CRLF）
+- 章名核对：`books/_src/head-first-html-css.toc.md`
+
+下面行号是在 `.txt` 里现查的（`Select-String` 带行号），不是估的、也不是抄的页码：
+
+| 本次用到的点 | 章节（章范围 = 该章在 .txt 里的行区间） | 行号 | 重点看 / 跳过 |
+|---|---|---|---|
+| `a` 标签与 `href`、属性语法 | 第 2 章「深入超文本」（2882–4460） | `<a>` 元素 3065–3098；`href` 3077–3122；**属性是什么 3126–3135** | 重点：`属性名="属性值"`、值必须带引号、不能自造属性（`href` 只能给 `<a>`）。跳过本章相对路径规划整段 |
+| `id` 做锚点、`target` 开新窗 | 第 4 章「连接上网」（6374–8188） | 目标锚点 **7537–7600**（"How to link to destination anchors" 在 7577）；新窗口 **7778–7806**（`target="_blank"` 例子在 7802） | 重点：给元素加 `id`、链接写 `#该 id`、`target` 指定窗口。跳过托管 / 域名 / FTP / 默认页 |
+| `ul` / `ol` / `li` | 第 3 章「网页构造」（4461–6373） | 列表的两步构造 **5470–5518**；5518 行还反问了一句 `Is <ol> a block element or inline? What about <li>?` | 重点：`<ul>` 配 `<li>`、能嵌套、能混排。跳过第 13 章的表格与 `list-style-type` 细节 |
+| 块级 / 内联 | 第 3 章「网页构造」 | **5091–5135**：5095 行点名 block = `h1~h6`/`p`/`blockquote`，5096 行点名 inline = `q`/`a`/`em`；"block elements stand on their own; inline elements go with the flow" 在 5115–5116 | 这一段就是「`li` 为什么默认竖成一列、必须 `display: inline-block` 才横过来」的答案。跳过第 12 章的 `float`/`position` |
+| `div` / `span` | 第 11 章「divs and spans」（18339–20914） | 18470–18532（18472 "a `<div>` lets you divide your page into…"；18532 "Using `<div>`s to mark sections"） | 重点：`div` 分块、`span` 只圈行内片段。跳过章末伪类 / 层叠 / 特异性 |
+| `class` vs `id` | 第 10 章「the box model」（16509–18338） | **17752–17806**（17756 行书里自问"id 不是给页面内锚点用的吗"；17802 "The id attribute"） | 重点：`id` 全页唯一 → 才能当锚点；`class` 可复用。书里**不推荐** `style` 属性，本次作业要求用它上色，照做，但别当成书的规矩 |
+
+读的顺序：**第 2 章 3126–3135 → 第 4 章 7537–7600 与 7778–7806 → 第 3 章 5091–5135 与 5470–5518 → 第 11 章 18470–18532**。第 10 章的 `class`/`id` 现在扫一眼，正式学留给盒模型那一轮。
+
+## 顺手修掉：接力上下文第 4 段（T-047）
+
+这份接力上下文的第 4 段原本整段是「知识地图里找不到这个知识点」——可地图里明明有这本书。
+根因两条：`op_handoff` 用**原始**地图查（地图点 = 书上原话如「id 做页面内锚点」），
+而任务卡记的是**画像概念名**（「超链接 a 标签（href/target）」），精确同名交集 0；
+且 `next` 早就做了 `apply_alignment`，handoff 这条路径漏了。只补 `apply_alignment` 还不够——
+它是**替换**语义，会把"照书抄原名"的查法改坏（新测试当场抓到），最终用新增的
+`merge_aligned_names` 让同一章同时保留两套名字。
+
+- 任务卡：`项目文档/任务卡-T-047-接力上下文书籍出处对齐.md`
+- 测试：`tests/test_t047_handoff_alignment.py`（3 条；红绿对照：改前 1 failed / 改后 3 passed）
+- 修后重生成的 `profile/handoff/2026-09-29-1341.md` 第 4 段：
+  - 「超链接 a 标签（href/target）」· 第 2 章 深入超文本
+  - 「列表（ul/ol/li）」· 第 3 章 网页构造
+  - 「块元素与行内元素（div/span）」· 第 3 章 网页构造
+  - 「HTML 属性（class/id/style）」· 第 1 章 认识 HTML
+
+## 二次接力复跑：把「零覆盖」变成机器证据 + 出处两处修正（2026-09-29 二轮）
+
+把上面那份接力上下文原样贴进新窗口又跑了一遍。除了确认上一节结论没变，新加两件事。
+
+### 1. 提交原文单独跑验收脚本（新增取证文件）
+
+把 `<h1>张三</h1>` **一个字符不改**存进最小骨架，落成 `_submit_lo.html`，然后 `node verify-nav.js _submit_lo.html`：
+
+```
+== 验收 3：id / href 对应表 ==
+┌─────────┐
+│ (index) │
+├─────────┤
+└─────────┘
+脚本失败: page.evaluate: TypeError: Failed to execute 'getComputedStyle' on 'Window':
+parameter 1 is not of type 'Element'.
+```
+
+- 验收 3 的对应表**零行**：`document.querySelectorAll(".nav a")` 返回空数组，没有一条可判定的链接；
+- 脚本接着在量导航背景色时抛错：`.nav` 元素根本不存在，`getComputedStyle(null)` 直接把脚本打断；
+- 所以这份提交不是「写错了」，是「没有可被判定的对象」——三条验收方式、四条实现要点，全都在等一个还不存在的元素。
+
+同一脚本对本轮两份成品的复跑数字：
+
+| 文件 | 验收1 三个锚点 | 验收2 新标签页 | 验收3 id/href | 要点2 一行 | 要点4 背景色 | pageerror |
+|---|---|---|---|---|---|---|
+| `nav.html` | 3/3 PASS（scrollY 49 / 642 / 1235，小节顶部距视口 0px） | PASS（弹出新标签，原页未关） | 3/3 `idExists: true` | `liTops [18,18,18,18]` → true | `rgb(255, 233, 179)` | 无 |
+| `nav-min.html` | 3/3 PASS（134 / 807 / 1480，距视口 0px） | PASS | 3/3 true | `liTops [18,18,18,18]` → true | `rgb(255, 233, 179)` | 无 |
+| `_submit_lo.html` | 无从点击（0 个 `.nav a`） | 无从点击（0 个外站链接） | **0 行** | 脚本抛错 | 脚本抛错 | 未跑到那一行 |
+
+### 2. 出处修正：handoff 第 4 段有两处对不上书
+
+用 `Select-String -SimpleMatch -Encoding UTF8` 在 `books/_src/head-first-html-css.txt` 里逐条复验，另外四条出处全部命中，**两条需要修**：
+
+| handoff 第 4 段写的 | 实测（行号可直接 Ctrl+G 跳） | 差额 |
+|---|---|---|
+| 「超链接 a 标签（href/target）」· 第 2 章 深入超文本 | `href` 那半对：第 2 章 3077–3122（`href` 属性），属性语法 3126–3171；**`target` 不在这章** | `target="_blank"` 在第 **4** 章「连接上网」**7778–7806**，例子在 **7802** 行 `<a target="_blank" href="http://buzz.headfirstlabs.com">` |
+| 「HTML 属性（class/id/style）」· 第 1 章 认识 HTML | **第 1 章（行 1–2882）里 `class="` / `id="` / `style="` 命中 0 次** | 第 1 章只有「属性」这个概念（2649 行 "Opening tags can have attributes."、2375/2400 讲 `<style type="text/css">` 的 `type`）。属性语法专节在第 **2** 章 **3126–3171**；`id` 做锚点在第 **4** 章 **7988**（"Use the id attribute to create a destination"）；`class` vs `id` 在第 **10** 章 **17752–17806**（17802 "The id attribute"） |
+
+命中的四条（复验一致，可当据）：7577 "How to link to destination anchors"；5115 "block elements stand on their own"；5470–5518 列表两步构造（5518 行原书自己反问 "Is `<ol>` a block element or inline? What about `<li>`?"）；18532 "Using `<div>`s to mark sections"；17802 "The id attribute"。
+
+**给下一轮的一句话**：画像概念名对齐到章节这一步（T-047）已经能用，但「同一概念名覆盖了跨两章的正文」（href 在第 2 章、target 在第 4 章）和「概念名里的三个属性其实分散在第 2/4/10 章」这两种情况，它对不齐——需要按行号而不是按章名落出处。
+
+### 3. 本轮改动与回滚
+
+新增：`_submit_lo.html`（本轮取证用，非教学文件）。
+改动：本节追加到 `notes/nav-验收对照.md`（追加前副本：`notes/nav-验收对照.md.bak`）。
+
+```powershell
+Remove-Item _submit_lo.html -ErrorAction SilentlyContinue
+Copy-Item 'notes\nav-验收对照.md.bak' 'notes\nav-验收对照.md' -Force
+```

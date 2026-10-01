@@ -1,6 +1,5 @@
 # 凭证与本地数据，永不进仓库
 .env
-notes/
 books/
 __pycache__/
 *.pyc
