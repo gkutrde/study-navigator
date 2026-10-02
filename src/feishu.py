@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 import requests
 
@@ -177,29 +177,53 @@ class FeishuClient:
         obj_token, _ = self.resolve_wiki_node(token)
         return obj_token
 
+    def _paginate(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        failed: str,
+        missing_items: str,
+        bad_paging: str,
+    ) -> Iterator[list[Any]]:
+        """逐页取飞书列表接口的 items（has_more / page_token 协议）。
+
+        三段文案由调用方给：拉取失败的前缀、缺 items 列表、分页异常——
+        保证两处调用（列子节点 / 取文档块）报错口径一致，又各自带上下文。
+        """
+        page_token: str | None = None
+        while True:
+            query = dict(params)
+            if page_token:
+                query["page_token"] = page_token
+            try:
+                payload = self._get(url, params=query)
+            except FeishuApiError as exc:
+                raise FeishuApiError(f"{failed}：{exc}") from None
+            items = payload.get("items")
+            if not isinstance(items, list):
+                raise FeishuApiError(missing_items)
+            yield items
+            if not payload.get("has_more"):
+                return
+            page_token = payload.get("page_token")
+            if not page_token:
+                raise FeishuApiError(bad_paging)
+
     def fetch_wiki_children(self, space_id: str, parent_node_token: str) -> list[WikiChild]:
         """列举某 wiki 节点下的全部直接子节点（分页聚合，T-009）。
 
         注意：该接口需要应用身份权限 wiki:node:retrieve；只有 wiki:node:read 时会报 99991672。
         """
         children: list[WikiChild] = []
-        page_token: str | None = None
-        while True:
-            params: dict[str, Any] = {
-                "parent_node_token": parent_node_token,
-                "page_size": WIKI_CHILDREN_PAGE_SIZE,
-            }
-            if page_token:
-                params["page_token"] = page_token
-            try:
-                payload = self._get(WIKI_LIST_NODES_URL.format(space_id=space_id), params=params)
-            except FeishuApiError as exc:
-                raise FeishuApiError(
-                    f"列举 wiki 节点 {parent_node_token} 的子节点失败：{exc}"
-                ) from None
-            items = payload.get("items")
-            if not isinstance(items, list):
-                raise FeishuApiError(f"wiki 节点 {parent_node_token} 的子节点响应缺少 items 列表")
+        pages = self._paginate(
+            WIKI_LIST_NODES_URL.format(space_id=space_id),
+            {"parent_node_token": parent_node_token, "page_size": WIKI_CHILDREN_PAGE_SIZE},
+            failed=f"列举 wiki 节点 {parent_node_token} 的子节点失败",
+            missing_items=f"wiki 节点 {parent_node_token} 的子节点响应缺少 items 列表",
+            bad_paging=f"wiki 节点 {parent_node_token} 分页异常：has_more 为真但没有 page_token",
+        )
+        for items in pages:
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -216,35 +240,21 @@ class FeishuClient:
                         space_id=str(item.get("space_id") or space_id),
                     )
                 )
-            if not payload.get("has_more"):
-                return children
-            page_token = payload.get("page_token")
-            if not page_token:
-                raise FeishuApiError(
-                    f"wiki 节点 {parent_node_token} 分页异常：has_more 为真但没有 page_token"
-                )
+        return children
 
     def fetch_blocks(self, document_id: str) -> list[dict[str, Any]]:
         """分页取回文档全部块（T-002）。"""
-        items: list[dict[str, Any]] = []
-        page_token: str | None = None
-        while True:
-            params: dict[str, Any] = {"page_size": BLOCKS_PAGE_SIZE, "document_revision_id": -1}
-            if page_token:
-                params["page_token"] = page_token
-            try:
-                payload = self._get(BLOCKS_URL.format(document_id=document_id), params=params)
-            except FeishuApiError as exc:
-                raise FeishuApiError(f"文档 {document_id} 块内容拉取失败：{exc}") from None
-            page_items = payload.get("items")
-            if not isinstance(page_items, list):
-                raise FeishuApiError(f"文档 {document_id} 的块响应缺少 items 列表")
-            items.extend(page_items)
-            if not payload.get("has_more"):
-                return items
-            page_token = payload.get("page_token")
-            if not page_token:
-                raise FeishuApiError(f"文档 {document_id} 分页异常：has_more 为真但没有 page_token")
+        blocks: list[dict[str, Any]] = []
+        pages = self._paginate(
+            BLOCKS_URL.format(document_id=document_id),
+            {"page_size": BLOCKS_PAGE_SIZE, "document_revision_id": -1},
+            failed=f"文档 {document_id} 块内容拉取失败",
+            missing_items=f"文档 {document_id} 的块响应缺少 items 列表",
+            bad_paging=f"文档 {document_id} 分页异常：has_more 为真但没有 page_token",
+        )
+        for items in pages:
+            blocks.extend(items)
+        return blocks
 
     def fetch_plain_text(self, document_id: str) -> str:
         """取文档正文纯文本。"""

@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-import json
 import re
 
-from .llm import LLMError
+from .fileio import write_text_atomic
+from .llm import JSONExtractionError, LLMError, extract_json
 
 __all__ = [
     "BookMap",
@@ -37,20 +37,17 @@ __all__ = [
 ]
 
 DEFAULT_SYLLABUS_PATH = Path("profile") / "syllabus.md"
-FRONTMATTER_PATTERN = "---*"
 # 块上限（T-010 实测选定）：实测蒸馏稿的二级节最大 16.7K 字符，
 # 取 30000 可让绝大多数章节**不被硬切**（保住章节语义），同时把 7 本书的调用数从 60 降到 25。
 DEFAULT_CHUNK_CHARS = 30000
 DEFAULT_SECTION_LEVEL = 2
 _TITLE_KEYS = ("title", "书名", "book")
 
-_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(?P<body>.*?)\n```\s*$", re.M | re.S)
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(?P<body>.*?)\n---\s*\n?", re.S)
 _HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<name>.+?)\s*$")
-_CHAPTER_RE = re.compile(r"^##\s+(?P<name>.+?)\s*$")
 _POINT_RE = re.compile(r"^\s*[-*]\s+(?P<name>.+?)\s*$")
-_FENCE_CHAR = chr(96) * 3
-_JSON_FENCE_RE = re.compile("^" + _FENCE_CHAR + "(?:json)?\\s*\\n(?P<body>.*?)\\n" + _FENCE_CHAR + "\\s*$", re.M | re.S)
+_BOOK_HEADING_RE = re.compile(r"^##\s+(?!#)(?P<name>.+?)\s*$")
+_CHAPTER_HEADING_RE = re.compile(r"^###\s+(?P<name>.+?)\s*$")
 
 
 class SyllabusError(RuntimeError):
@@ -256,25 +253,12 @@ def merge_chapters(groups: list[list[Chapter]]) -> list[Chapter]:
 
 def parse_chapters(raw: str) -> list[Chapter]:
     """解析 LLM 返回的章节 JSON。容忍 ```json 围栏与前后多余文字。"""
-    text = (raw or "").strip()
-    fenced = _JSON_FENCE_RE.search(text)
-    if fenced:
-        text = fenced.group(1).strip()
-
-    starts = [index for index in (text.find("["), text.find("{")) if index >= 0]
-    if not starts:
-        raise SyllabusError("LLM 输出里找不到 JSON")
-    decoder = json.JSONDecoder()
-    payload = None
-    last_error: Exception | None = None
-    for start in sorted(starts):
-        try:
-            payload, _ = decoder.raw_decode(text[start:])
-            break
-        except ValueError as exc:
-            last_error = exc
-    if payload is None:
-        raise SyllabusError(f"LLM 输出的 JSON 无法解析：{last_error}")
+    try:
+        payload = extract_json(raw)
+    except JSONExtractionError as exc:
+        if exc.reason == "invalid":
+            raise SyllabusError(f"LLM 输出的 JSON 无法解析：{exc.detail}") from None
+        raise SyllabusError("LLM 输出里找不到 JSON") from None
 
     if isinstance(payload, dict):
         payload = payload.get("chapters") or payload.get("chapter") or []
@@ -295,7 +279,6 @@ def parse_chapters(raw: str) -> list[Chapter]:
     if not chapters:
         raise SyllabusError("LLM 没有给出任何章节")
     return chapters
-
 
 
 def render_syllabus(books: list[BookMap]) -> str:
@@ -319,13 +302,13 @@ def parse_syllabus(markdown: str) -> list[BookMap]:
 
     for raw in (markdown or "").splitlines():
         line = raw.rstrip()
-        book_match = re.match(r"^##\s+(?!#)(?P<name>.+?)\s*$", line)
+        book_match = _BOOK_HEADING_RE.match(line)
         if book_match:
             current_book = BookMap(book=book_match.group("name"))
             books.append(current_book)
             current_chapter = None
             continue
-        chapter_match = re.match(r"^###\s+(?P<name>.+?)\s*$", line)
+        chapter_match = _CHAPTER_HEADING_RE.match(line)
         if chapter_match and current_book is not None:
             current_chapter = Chapter(chapter=chapter_match.group("name"))
             current_book.chapters.append(current_chapter)
@@ -345,18 +328,10 @@ def load_syllabus(path: Path | str) -> list[BookMap]:
 
 def write_syllabus(path: Path | str, books: list[BookMap]) -> Path:
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
     try:
-        tmp.write_text(render_syllabus(books), encoding="utf-8")
-        tmp.replace(target)
+        return write_text_atomic(target, render_syllabus(books))
     except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise SyllabusError(f"写入知识地图失败：{target}（{type(exc).__name__}）") from None
-    return target
 
 
 def import_book(

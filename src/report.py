@@ -7,13 +7,11 @@
 from __future__ import annotations
 
 import datetime
-import os
 from pathlib import Path
 import subprocess
-import sys
 
 from .planner import is_review_record, read_task_records
-from .profile import LEVELS, KnowledgeProfile
+from .profile import LEVELS, MASTERED_LEVELS, KnowledgeProfile
 from .silent import silent_kwargs
 from .weaknesses import load_weaknesses
 
@@ -50,12 +48,7 @@ def collect_stats(profile_dir: Path | str, *, days: int = DEFAULT_DAYS, today=No
     since = now - datetime.timedelta(days=max(0, int(days)) - 1)
 
     profile = KnowledgeProfile.load(directory / "knowledge.md")
-    mastered = ("学过", "做过", "输出")
-
-    moved: list = []
-    for point in profile.points:
-        if _in_window(getattr(point, "last_touched", ""), since, now):
-            moved.append(point)
+    moved = [point for point in profile.points if _in_window(point.last_touched, since, now)]
 
     tasks = read_task_records(directory / "tasks.md")
     fresh_tasks = [t for t in tasks if _in_window(t.when, since, now)]
@@ -83,16 +76,14 @@ def collect_stats(profile_dir: Path | str, *, days: int = DEFAULT_DAYS, today=No
         "since": since,
         "until": now,
         "moved": moved,
-        "moved_by_level": {
-            level: len([p for p in moved if p.level == level]) for level in LEVELS
-        },
+        "moved_by_level": {level: sum(1 for p in moved if p.level == level) for level in LEVELS},
         "tasks": fresh_tasks,
         "review_tasks": review_tasks,
         "completed_reviews": completed_reviews,
         "weaknesses": weaknesses,
         "fresh_weaknesses": fresh_weaknesses,
         "commits": commits,
-        "mastered_total": len([p for p in profile.points if p.level in mastered]),
+        "mastered_total": sum(1 for p in profile.points if p.level in MASTERED_LEVELS),
         "points_total": len(profile.points),
     }
 
@@ -137,87 +128,67 @@ def build_report(
 ) -> str:
     """生成 markdown 周报（四个板块 + 全图摘要）。"""
     stats = collect_stats(profile_dir, days=days, today=today, repo_root=repo_root)
-    lines: list[str] = []
-
-    lines.append("# 学习周报复盘 · 最近 " + str(stats["days"]) + " 天")
-    lines.append("")
-    lines.append(
-        "窗口：**" + stats["since"].isoformat() + " → " + stats["until"].isoformat() + "**"
-        " ｜ 画像共 " + str(stats["points_total"]) + " 个点（已掌握 " + str(stats["mastered_total"]) + "）"
-    )
-    lines.append("")
+    lines: list[str] = [
+        f"# 学习周报复盘 · 最近 {stats['days']} 天",
+        "",
+        f"窗口：**{stats['since'].isoformat()} → {stats['until'].isoformat()}**"
+        f" ｜ 画像共 {stats['points_total']} 个点（已掌握 {stats['mastered_total']}）",
+        "",
+    ]
 
     # --- 状态迁移 ---
-    lines.append("## 状态迁移")
-    lines.append("")
+    lines += ["## 状态迁移", ""]
     moved = stats["moved"]
     if not moved:
         lines.append("- 窗口内没有知识点被碰到。")
     else:
-        lines.append("- 共 **" + str(len(moved)) + "** 个知识点在窗口内被推进（moved=" + str(len(moved)) + "）：")
-        by_level = stats["moved_by_level"]
-        detail = "、".join(
-            str(level) + " " + str(count) for level, count in by_level.items() if count
-        )
+        lines.append(f"- 共 **{len(moved)}** 个知识点在窗口内被推进（moved={len(moved)}）：")
+        detail = "、".join(f"{level} {count}" for level, count in stats["moved_by_level"].items() if count)
         lines.append("  - 现在状态分布：" + (detail or "无"))
-        lines.append("")
-        lines.append("| 知识点 | 现在状态 | 最近 |")
-        lines.append("| --- | --- | --- |")
-        for point in moved:
-            lines.append(
-                "| " + point.name + " | " + point.level + " | "
-                + (getattr(point, "last_touched", "") or "-") + " |"
-            )
+        lines += ["", "| 知识点 | 现在状态 | 最近 |", "| --- | --- | --- |"]
+        lines += [f"| {point.name} | {point.level} | {point.last_touched or '-'} |" for point in moved]
     lines.append("")
 
     # --- 任务完成 ---
-    lines.append("## 任务完成")
-    lines.append("")
+    lines += ["## 任务完成", ""]
     tasks = stats["tasks"]
-    lines.append("- 窗口内新增 **" + str(len(tasks)) + "** 道任务。")
+    lines.append(f"- 窗口内新增 **{len(tasks)}** 道任务。")
     if tasks:
         lines.append("")
-        for task in tasks:
-            flag = "【复习】" if is_review_record(task) else ""
-            lines.append("- " + task.when + "　" + flag + str(task.goal))
+        lines += [
+            f"- {task.when}　{'【复习】' if is_review_record(task) else ''}{task.goal}" for task in tasks
+        ]
     lines.append("")
     commits = stats["commits"]
     if commits:
-        lines.append("- git 提交 " + str(len(commits)) + " 次：")
+        lines.append(f"- git 提交 {len(commits)} 次：")
         lines.extend("  - " + item for item in commits)
     else:
         lines.append("- git：窗口内**没有提交**（活动都还在工作区里）。")
     lines.append("")
 
     # --- 薄弱点 ---
-    lines.append("## 薄弱点")
-    lines.append("")
+    lines += ["## 薄弱点", ""]
     weaknesses = stats["weaknesses"]
     if not weaknesses:
         lines.append("- 错题本是空的——没有反复犯的问题。")
     else:
-        lines.append("- 当前清单 " + str(len(weaknesses)) + " 条：")
-        for item in weaknesses:
-            stamp = ("（最近 " + item.last_seen + "）") if item.last_seen else ""
-            lines.append("- " + item.text + stamp)
-        fresh = stats["fresh_weaknesses"]
-        lines.append("")
-        lines.append("- 窗口内新增/复现：" + str(len(fresh)) + " 条")
+        lines.append(f"- 当前清单 {len(weaknesses)} 条：")
+        lines += [
+            f"- {item.text}" + (f"（最近 {item.last_seen}）" if item.last_seen else "") for item in weaknesses
+        ]
+        lines += ["", f"- 窗口内新增/复现：{len(stats['fresh_weaknesses'])} 条"]
     lines.append("")
 
     # --- 复习完成率 ---
-    lines.append("## 复习完成率")
-    lines.append("")
+    lines += ["## 复习完成率", ""]
     review_tasks = stats["review_tasks"]
     completed = stats["completed_reviews"]
     if not review_tasks:
         lines.append("- 窗口内没有复习题。")
     else:
         rate = int(round(completed * 100 / len(review_tasks)))
-        lines.append(
-            "- 复习题 **" + str(completed) + "/" + str(len(review_tasks)) + "**"
-            + " 已完成（完成率 " + str(rate) + "%）。"
-        )
+        lines.append(f"- 复习题 **{completed}/{len(review_tasks)}** 已完成（完成率 {rate}%）。")
     lines.append("")
 
-    return chr(10).join(lines).rstrip() + chr(10)
+    return "\n".join(lines).rstrip() + "\n"

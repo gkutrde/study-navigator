@@ -42,6 +42,14 @@ DEFAULT_TIMEOUT_SECONDS = 600
 
 TRUNCATED_NOTICE = "\n\n【说明】上面的上下文超过 {limit} 字符，已截断——只保留了前 {kept} 字符。"
 
+# prompt 的固定头尾：终端单次（assemble_prompt）与面板多轮（chat_session.build_prompt）共用
+CONTEXT_HEAD = "下面是这道练习的接力上下文，请据此回答我的问题：\n\n"
+
+
+def question_tail(ask: str) -> str:
+    """prompt 末尾的「我的问题」段。"""
+    return f"\n\n【我的问题】{ask}\n"
+
 
 def read_handoff(profile_dir: Path | str, when: str) -> str:
     """读某个任务的接力上下文；没有就提示用户先去点按钮。"""
@@ -68,8 +76,8 @@ def assemble_prompt(context: str, question: str) -> str:
         raise ChatError("请给出要问的问题，例如：chat \"2026-09-27 10:00\" \"我该看书的哪部分？\"")
 
     body = str(context or "").strip()
-    head = "下面是这道练习的接力上下文，请据此回答我的问题：\n\n"
-    tail = f"\n\n【我的问题】{ask}\n"
+    head = CONTEXT_HEAD
+    tail = question_tail(ask)
 
     fixed = len(head) + len(tail)
     if fixed + len(body) <= MAX_PROMPT_CHARS:
@@ -206,9 +214,7 @@ def headless_persona_override(home: Path | str | None = None) -> str | None:
 
     这不是我们要"修"的东西（那是用户的全局 DSH 配置），但**必须如实告诉用户**。
     """
-    import os as _os
-
-    root = Path(home) if home else Path(_os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
+    root = Path(home) if home else Path(os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
     patch = root / "profiles" / "headless" / "cordis.patch.yml"
     if not patch.is_file():
         return None

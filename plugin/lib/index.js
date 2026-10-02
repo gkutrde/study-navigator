@@ -2,8 +2,50 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
+//#region src/shared.ts
+/**
+* 插件两半共用的常量与数据形状：浏览器面板（src/client/）与 Node 服务端路由（src/server/）。
+*
+* 两半分别打包成 lib/client.js 与 lib/index.js，本文件会被各自内联进去；
+* 以前同样的东西两边各写一份（工作区名、画像/任务/地图的数据形状），改一边忘一边。
+*/
+/**
+* 插件只在这个工作区启用（T-050）：
+* - 客户端：面板只在「当前会话属于该工作区」时渲染；
+* - 服务端：/api/learning 只接受来自该工作区的请求（按宿主工作区注册表核验，不信客户端自报的标题）。
+* 工作区本身由 T-046 引入：项目目录登记成工作区并改名为它。
+*/
+const WORKSPACE_TITLE = "学习领航员";
+/** 把任意异常变成给人看的一句话（面板与服务端共用，避免到处写 String(cause.message || cause)）。 */
+function errorText(cause) {
+	if (cause && typeof cause === "object" && "message" in cause) {
+		const message = String(cause.message ?? "");
+		if (message) return message;
+	}
+	return String(cause);
+}
+
+//#endregion
 //#region src/server/learning.ts
 const ROUTE = "/api/learning";
+function ok(fields = {}) {
+	return {
+		status: 200,
+		payload: {
+			ok: true,
+			...fields
+		}
+	};
+}
+function fail(status, message) {
+	return {
+		status,
+		payload: {
+			ok: false,
+			message
+		}
+	};
+}
 /** Python 解释器：允许环境变量或插件配置覆盖（不同机器路径不同）。 */
 function pythonExecutable(configured) {
 	const value = String(configured ?? process.env.LEARNING_PYTHON ?? "").trim();
@@ -15,6 +57,77 @@ function jsonResponse(status, payload) {
 		status,
 		headers: { "content-type": "application/json; charset=utf-8" }
 	});
+}
+/**
+* 核验请求是否来自「学习领航员」工作区。
+*
+* 客户端只报**工作区 id**；标题与目录以宿主注册表为准（不信客户端自报的标题）。
+* 拿不到注册表接缝就**拒绝**（失败即关闭）：宁可面板不可用，也不在别的工作区里放行。
+*/
+function checkWorkspace(registry, workspaceId) {
+	const source = registry;
+	if (!source || typeof source.get !== "function") return {
+		ok: false,
+		status: 503,
+		message: "宿主没有工作区注册表接缝（workspaceRegistry），无法确认请求来自「" + WORKSPACE_TITLE + "」工作区，面板不可用"
+	};
+	const id = String(workspaceId ?? "").trim();
+	if (!id) return {
+		ok: false,
+		status: 403,
+		message: "学习面板只在「" + WORKSPACE_TITLE + "」工作区启用：请求没有带工作区"
+	};
+	let workspace;
+	try {
+		workspace = source.get(id);
+	} catch {
+		workspace = void 0;
+	}
+	if (!workspace) return {
+		ok: false,
+		status: 403,
+		message: "学习面板只在「" + WORKSPACE_TITLE + "」工作区启用：找不到工作区 " + id
+	};
+	const title = String(workspace.title ?? "");
+	if (title !== WORKSPACE_TITLE) return {
+		ok: false,
+		status: 403,
+		message: "学习面板只在「" + WORKSPACE_TITLE + "」工作区启用（当前工作区：" + (title || id) + "）"
+	};
+	return {
+		ok: true,
+		workspaceId: id,
+		path: String(workspace.path ?? "")
+	};
+}
+/**
+* 一次面板请求的完整处理：工作区过滤 → 定项目根 → 分派动作。
+*
+* 与宿主无关（注册表从参数传入），契约测试直接调它。
+*/
+async function serveLearning(body, deps) {
+	const gate = checkWorkspace(deps.registry, body.workspaceId);
+	if (!gate.ok) return fail(gate.status, gate.message);
+	const root = resolveProjectRoot(String(body.projectRoot ?? deps.config?.projectRoot ?? "").trim() || gate.path || void 0, deps.cwd ?? process.cwd());
+	const result = await handleLearning(body, {
+		root,
+		python: pythonExecutable(deps.config?.python)
+	});
+	return {
+		status: result.status,
+		payload: {
+			...result.payload,
+			projectRoot: root
+		}
+	};
+}
+/** 宿主注入了 workspaceRegistry 才读得到；没声明 / 没有时 cordis 会抛错，这里统一当"没有"。 */
+function workspaceRegistryOf(ctx) {
+	try {
+		return ctx?.workspaceRegistry;
+	} catch {
+		return;
+	}
 }
 /**
 * 在宿主上注册面板路由。
@@ -46,15 +159,11 @@ function registerLearningRoute(ctx, config = {}) {
 				ok: false,
 				message: "请求体必须是对象"
 			});
-			const root = resolveProjectRoot(String(body.projectRoot ?? config.projectRoot ?? "").trim() || void 0, process.cwd());
-			const result = await handleLearning(body, {
-				root,
-				python: pythonExecutable(config.python)
+			const result = await serveLearning(body, {
+				registry: workspaceRegistryOf(ctx),
+				config
 			});
-			return jsonResponse(result.status, {
-				...result.payload,
-				projectRoot: root
-			});
+			return jsonResponse(result.status, result.payload);
 		}
 	});
 }
@@ -80,23 +189,31 @@ const CLI_SUBCOMMANDS = [
 ];
 /** 单次 CLI 调用的墙钟上限（出题要真调模型，给足）。 */
 const CLI_TIMEOUT_MS = 600 * 1e3;
+/** 降级讨论时送进 chat 的内容上限（与 Python 侧 prompt 上限同一数量级，防止超长参数）。 */
+const MAX_CHAT_MESSAGE_CHARS = 4e3;
+/**
+* 项目根的标志：既有 profile/（面板要读的数据），又有 src/cli.py（动作要跑的 CLI）。
+* 以前只认 README.md——plugin/ 自己也有 README.md，从插件目录往上找会停在插件目录。
+*/
+function isProjectRoot(directory) {
+	return existsSync(join(directory, "profile")) && existsSync(join(directory, "src", "cli.py"));
+}
 /**
 * 解析项目根目录。
-* 优先用配置里的值；否则从 profile/ 往上找 README.md 认根（和看板同一个策略）。
+* 优先用配置里的值（相对路径相对 fallback）；否则从 fallback 往上找项目根标志。
 */
 function resolveProjectRoot(configured, fallback) {
-	if (configured && String(configured).trim()) {
-		const value = String(configured).trim();
-		return isAbsolute(value) ? resolve(value) : resolve(fallback || process.cwd(), value);
-	}
-	let current = resolve(fallback || process.cwd());
+	const base = resolve(fallback || process.cwd());
+	const value = String(configured ?? "").trim();
+	if (value) return isAbsolute(value) ? resolve(value) : resolve(base, value);
+	let current = base;
 	for (let i = 0; i < 6; i += 1) {
-		if (existsSync(join(current, "README.md"))) return current;
+		if (isProjectRoot(current)) return current;
 		const parent = dirname(current);
 		if (parent === current) break;
 		current = parent;
 	}
-	return resolve(fallback || process.cwd());
+	return base;
 }
 function readText(path) {
 	try {
@@ -140,7 +257,7 @@ function readProfile(root) {
 		total: points.length
 	};
 }
-/** 任务列表：时间戳 + 目标 + 是否复习题 + 最近一次点评。 */
+/** 任务列表：时间戳 + 目标 + 是否复习题。 */
 function readTasks(root) {
 	return readText(join(root, "profile", "tasks.md")).split(/^##\s+(?=\d{4}-\d{2}-\d{2})/m).slice(1).map((block) => {
 		const when = (block.split(/\r?\n/)[0] || "").trim();
@@ -154,23 +271,31 @@ function readTasks(root) {
 	});
 }
 /**
+* 任务时间戳 → handoff 文件名里的任务 id。
+*
+* 与 Python 的 handoff.task_file_id 同一规则（那边是唯一权威）：去掉冒号，其余不安全字符压成 "-"，
+* 首尾的 - . _ 去掉。"2026-09-27 10:30" → "2026-09-27-1030"。
+* Python 的 \w 是 Unicode 字母/数字/下划线，这里用 \p{L}\p{N}_（u 标志）对齐，不只认 ASCII 与 CJK。
+* 路径分隔符、.. 都会被压掉，拼不出 handoff 目录以外的路径。
+*/
+function taskFileId(when) {
+	return String(when ?? "").trim().replace(/[:：]/g, "").replace(/[^\p{L}\p{N}_\u4e00-\u9fff.-]+/gu, "-").replace(/^[-._]+|[-._]+$/g, "");
+}
+/**
 * 读某道任务的接力上下文（handoff），给「讨论」按钮预填用。
 *
 * 服务端**不创建会话**：那要由客户端用宿主的公开会话接缝做（T-040）。
 * 这里只负责把本地文件如实交付出去。
 */
 function readHandoff(root, when) {
-	const stamp = String(when ?? "").trim();
-	if (!stamp) return null;
-	const id = stamp.replace(/[^0-9]/g, "").slice(0, 12);
+	const id = taskFileId(when);
 	if (!id) return null;
-	const direct = join(root, "profile", "handoff", stamp.slice(0, 10) + "-" + id.slice(8, 12) + ".md");
-	const text = readText(direct);
-	if (text) return {
-		path: direct,
+	const path = join(root, "profile", "handoff", id + ".md");
+	const text = readText(path);
+	return text ? {
+		path,
 		text
-	};
-	return null;
+	} : null;
 }
 /** 这条面板链路的**能力自述**：客户端据此决定走原生还是降级。 */
 function capabilities() {
@@ -207,18 +332,24 @@ function readSyllabus(root) {
 *
 * 安全：spawn + 参数数组 + **shell: false**。用户给的值只作为数组元素传入，
 * 永远不会被拼进命令字符串，所以分号/反引号/管道都只是普通字符。
+* 失败一律变成中文说明（非零退出带上 stderr 摘要），不把堆栈抛给面板。
 */
 function runCli(root, args, python) {
-	const command = [
-		python,
-		"-m",
-		"src.cli",
-		...args
-	];
 	return new Promise((done) => {
+		let settled = false;
+		const finish = (result) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			done(result);
+		};
 		let child;
 		try {
-			child = spawn(command[0], command.slice(1), {
+			child = spawn(python, [
+				"-m",
+				"src.cli",
+				...args
+			], {
 				cwd: root,
 				shell: false,
 				windowsHide: true,
@@ -231,7 +362,7 @@ function runCli(root, args, python) {
 		} catch (cause) {
 			done({
 				ok: false,
-				output: "启动 CLI 失败：" + String(cause)
+				output: "启动 CLI 失败：" + errorText(cause)
 			});
 			return;
 		}
@@ -241,7 +372,7 @@ function runCli(root, args, python) {
 			try {
 				child.kill();
 			} catch {}
-			done({
+			finish({
 				ok: false,
 				output: "CLI 超时（超过 " + Math.round(CLI_TIMEOUT_MS / 6e4) + " 分钟）：出题要真调模型，可以稍后重试。"
 			});
@@ -252,26 +383,28 @@ function runCli(root, args, python) {
 		child.stderr?.on("data", (chunk) => {
 			err += String(chunk);
 		});
-		child.on("error", (cause) => {
-			clearTimeout(timer);
-			done({
-				ok: false,
-				output: "没找到 Python：" + String(cause.message || cause)
-			});
-		});
+		child.on("error", (cause) => finish({
+			ok: false,
+			output: "没找到 Python：" + errorText(cause)
+		}));
 		child.on("close", (code) => {
-			clearTimeout(timer);
 			const text = (out + (err ? "\n" + err : "")).trim();
-			if (code === 0) done({
+			if (code === 0) finish({
 				ok: true,
 				output: text
 			});
-			else done({
+			else finish({
 				ok: false,
 				output: "CLI 执行失败（退出码 " + code + "）：" + (text || "没有更多信息")
 			});
 		});
 	});
+}
+/** 取一个必填参数（去首尾空白）；缺了抛中文错误。 */
+function requireParam(params, key, message) {
+	const value = String(params[key] ?? "").trim();
+	if (!value) throw new Error(message);
+	return value;
 }
 /** 把动作 × 参数翻译成 CLI 参数数组（白名单之外一律拒绝）。 */
 function buildCliArgs(action, params) {
@@ -280,141 +413,84 @@ function buildCliArgs(action, params) {
 	if (!spec.cli) throw new Error("动作 " + action + " 不需要跑 CLI");
 	const [sub] = spec.cli;
 	if (!CLI_SUBCOMMANDS.includes(sub)) throw new Error("子命令不在白名单：" + sub);
-	const args = [sub];
-	const doc = String(params.doc ?? "").trim();
-	const name$1 = String(params.name ?? "").trim();
-	const path = String(params.path ?? "").trim();
-	const recite = String(params.recite ?? "").trim();
-	if (action === "sync") {
-		if (!doc) throw new Error("同步需要文档 ID 或 wiki 链接");
-		args.push(doc);
-		return args;
-	}
-	if (action === "next") return args;
-	if (action === "chat") {
-		const when = String(params.when ?? "").trim();
-		const message = String(params.message ?? "").trim();
-		if (!when) throw new Error("讨论需要任务时间戳");
-		if (!message) throw new Error("讨论需要内容");
-		args.push(when);
-		args.push(message.slice(0, 4e3));
-		return args;
-	}
+	if (action === "sync") return [sub, requireParam(params, "doc", "同步需要文档 ID 或 wiki 链接")];
+	if (action === "chat") return [
+		sub,
+		requireParam(params, "when", "讨论需要任务时间戳"),
+		requireParam(params, "message", "讨论需要内容").slice(0, MAX_CHAT_MESSAGE_CHARS)
+	];
 	if (action === "done") {
-		if (!name$1) throw new Error("回写需要知识点名称");
-		if (!path) throw new Error("回写需要产出路径");
-		args.push(name$1, path);
-		if (recite) args.push("--recite", recite);
-		return args;
+		const name$1 = requireParam(params, "name", "回写需要知识点名称");
+		const path = requireParam(params, "path", "回写需要产出路径");
+		const recite = String(params.recite ?? "").trim();
+		return recite ? [
+			sub,
+			name$1,
+			path,
+			"--recite",
+			recite
+		] : [
+			sub,
+			name$1,
+			path
+		];
 	}
-	return args;
+	return [sub];
 }
-/** 处理一次面板请求（纯函数，便于单测；不依赖宿主）。 */
+/** 只读动作：不跑 CLI，直接读 profile/ 下的文件。 */
+const READERS = {
+	capabilities: () => ok({ data: capabilities() }),
+	profile: (root) => ok({
+		data: readProfile(root),
+		capabilities: capabilities()
+	}),
+	tasks: (root) => ok({ data: readTasks(root) }),
+	syllabus: (root) => ok({ data: readSyllabus(root) }),
+	discuss: (root, body) => {
+		const handoff = readHandoff(root, String(body.when ?? ""));
+		if (!handoff) return fail(400, "读不到这道题的接力上下文：请先点「在 DSH 中继续」生成 handoff");
+		return ok({
+			data: handoff,
+			capabilities: capabilities()
+		});
+	}
+};
+/** 处理一次面板请求（纯函数，便于单测；不依赖宿主，也不做工作区过滤——那在 serveLearning）。 */
 async function handleLearning(body, options) {
 	const action = String(body.action ?? "").trim();
-	if (!(action in ACTIONS)) return {
-		status: 400,
-		payload: {
-			ok: false,
-			message: "未知动作：" + (action || "(空)")
-		}
-	};
+	if (!(action in ACTIONS)) return fail(400, "未知动作：" + (action || "(空)"));
 	const root = options.root;
-	if (!existsSync(join(root, "profile"))) return {
-		status: 400,
-		payload: {
-			ok: false,
-			message: "找不到项目：" + root + " 下没有 profile/ 目录（可在面板里改项目路径）"
-		}
-	};
-	if (action === "capabilities") return {
-		status: 200,
-		payload: {
-			ok: true,
-			data: capabilities()
-		}
-	};
-	if (action === "profile") return {
-		status: 200,
-		payload: {
-			ok: true,
-			data: readProfile(root),
-			capabilities: capabilities()
-		}
-	};
-	if (action === "discuss") {
-		const handoff = readHandoff(root, String(body.when ?? ""));
-		if (!handoff) return {
-			status: 400,
-			payload: {
-				ok: false,
-				message: "读不到这道题的接力上下文：请先点「在 DSH 中继续」生成 handoff"
-			}
-		};
-		return {
-			status: 200,
-			payload: {
-				ok: true,
-				data: handoff,
-				capabilities: capabilities()
-			}
-		};
-	}
-	if (action === "tasks") return {
-		status: 200,
-		payload: {
-			ok: true,
-			data: readTasks(root)
-		}
-	};
-	if (action === "syllabus") return {
-		status: 200,
-		payload: {
-			ok: true,
-			data: readSyllabus(root)
-		}
-	};
+	if (!existsSync(join(root, "profile"))) return fail(400, "找不到项目：" + root + " 下没有 profile/ 目录（可在面板里改项目路径）");
+	const reader = READERS[action];
+	if (reader) return reader(root, body);
 	let args;
 	try {
 		args = buildCliArgs(action, body);
 	} catch (cause) {
-		return {
-			status: 400,
-			payload: {
-				ok: false,
-				message: String(cause.message || cause)
-			}
-		};
+		return fail(400, errorText(cause));
 	}
 	const result = await runCli(root, args, options.python);
-	if (!result.ok) return {
-		status: 200,
-		payload: {
-			ok: false,
-			message: result.output
+	if (!result.ok) return fail(200, result.output);
+	return ok({
+		output: result.output,
+		data: {
+			profile: readProfile(root),
+			tasks: readTasks(root)
 		}
-	};
-	const after = {
-		profile: readProfile(root),
-		tasks: readTasks(root)
-	};
-	return {
-		status: 200,
-		payload: {
-			ok: true,
-			output: result.output,
-			data: after
-		}
-	};
+	});
 }
 
 //#endregion
 //#region src/index.ts
 const name = "dsh-learning-navigator";
-/** 只声明确定存在的公开接缝（客户端那半边是 ['slots']）。 */
-const inject = ["connection"];
+/**
+* 只声明确定存在的公开接缝（客户端那半边是 ['slots', ...]）：
+* - connection：注册 /api/learning 精确 Fetch 路由；
+* - workspaceRegistry：按工作区过滤请求（T-050，只接受「学习领航员」工作区）。
+*/
+const inject = ["connection", "workspaceRegistry"];
 function apply(ctx, rowConfig = {}) {
-	if (registerLearningRoute(ctx, rowConfig ?? {}) && typeof ctx.logger?.info === "function") ctx.logger.info("[学习领航员] 已注册 " + ROUTE + "（面板通道就绪）");
+	if (registerLearningRoute(ctx, rowConfig ?? {}) && typeof ctx.logger?.info === "function") ctx.logger.info("[学习领航员] 已注册 " + ROUTE + "（面板通道就绪，仅「学习领航员」工作区可用）");
 }
 
 //#endregion

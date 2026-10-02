@@ -1,16 +1,12 @@
-"""命令行入口。
+"""命令行入口：参数解析 + 把各命令接到业务模块上（本身不含业务逻辑）。
 
-已实现命令：
-
-- sync <文档ID|wiki链接>：拉取文档块 → 转 markdown → 落盘 notes/<id>.md，并打印正文纯文本。
-- distill <笔记文件>：调用 LLM 把笔记提炼成结构化知识点（名称+状态+证据）；
-  只输出结果，不写画像文件——画像合并与落盘是 T-004 的范围。
-
-子文档递归（T-009）、import/next/done（T-007）不在本任务范围。
+命令一览见 USAGE / KNOWN_COMMANDS；看板（serve）的固定动作也在这里接线（_build_board）。
+退出码约定：0 成功；1 运行失败（缺前置产物、LLM/飞书失败等）；2 参数错误（同时打印用法）。
 """
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -21,7 +17,7 @@ from urllib.parse import urlparse
 from .credentials import DEFAULT_ENV_PATH, CredentialError, load_credentials
 from .distill import DistillError, distill_note, format_points
 from .feishu import FeishuApiError, FeishuClient, Transport
-from .llm import PROVIDER_ALIASES, LLMClient, LLMError, config_for, resolve_provider
+from .llm import PROVIDER_ALIASES, LLMClient, LLMError, config_for, read_env_values, resolve_provider
 from .planner import (
     DEFAULT_STALE_DAYS,
     MIN_POINTS,
@@ -35,28 +31,30 @@ from .profile import (
     ProfileError,
     mark_done,
     merge_points,
-    touch_points,
     normalize_point_name,
+    resolve_point_name,
+    touch_points,
     write_profile_atomic,
 )
 from .alignment import DEFAULT_ALIGNMENT_NAME, AlignmentError
 from .syllabus import DEFAULT_SYLLABUS_PATH, SyllabusError, import_book
 from .sync import sync_document_tree
 
-USAGE = (
-    "用法：\n"
-    "  python -m src.cli sync <文档ID 或 wiki/docx 链接>\n"
-    "  python -m src.cli distill <笔记文件>|--all [--json] [--no-write] [--force] [--profile <画像路径>] [--provider kimi|deepseek]\n"
-    "  python -m src.cli next [--profile <画像路径>]\n"
-    "  python -m src.cli done <知识点> <产出路径> [--recite <费曼复述>] [--profile <画像路径>]" + chr(10)
-    + "  python -m src.cli import <books/ 中的文件名>\n"
-    + "  python -m src.cli align [--provider kimi|deepseek]   # 地图点对齐画像概念（T-021）\n"
-    + "  python -m src.cli explain <知识点> [--provider kimi|deepseek]   # 章节讲解（T-022）\n"
-    + "  python -m src.cli chat <任务时间戳> [\"问题\"]   # 终端接力：带问题单次答；不带问题进交互模式（T-032/T-034）\n"
-    + "  python -m src.cli review <任务时间戳> <代码文件>   # 作业点评（T-028）\n"
-    + "  python -m src.cli chat <任务时间戳> \"问题\"   # 终端接力：读接力上下文问 DSH（T-032）\n"
-    + "  python -m src.cli report [--days N] [--profile <画像路径>]   # 周报复盘（T-044）\n"
-    + "  python -m src.cli serve [--port 8765] [--no-browser]   # 本地互动看板"
+USAGE = "\n".join(
+    [
+        "用法：",
+        "  python -m src.cli sync <文档ID 或 wiki/docx 链接>",
+        "  python -m src.cli distill <笔记文件>|--all [--json] [--no-write] [--force] [--profile <画像路径>] [--provider kimi|deepseek]",
+        "  python -m src.cli next [--topic <主题>]... [--stale-days N] [--profile <画像路径>] [--provider kimi|deepseek]",
+        "  python -m src.cli done <知识点> <产出路径> [--recite <费曼复述>] [--profile <画像路径>]",
+        "  python -m src.cli import <books/ 中的文件名> [--provider kimi|deepseek]",
+        "  python -m src.cli align [--provider kimi|deepseek]   # 地图点对齐画像概念（T-021）",
+        "  python -m src.cli explain <知识点> [--refresh] [--provider kimi|deepseek]   # 章节讲解（T-022）",
+        "  python -m src.cli chat <任务时间戳> [\"问题\"]   # 终端接力：带问题单次答；不带问题进交互模式（T-032/T-034）",
+        "  python -m src.cli review <任务时间戳> <代码文件> [--provider kimi|deepseek]   # 作业点评（T-028）",
+        "  python -m src.cli report [--days N] [--profile <画像路径>]   # 周报复盘（T-044）",
+        "  python -m src.cli serve [--port 8765] [--no-browser]   # 本地互动看板",
+    ]
 )
 # T-032：chat 是终端接力命令（读 handoff + 调 dsh headless）
 KNOWN_COMMANDS = ("sync", "import", "distill", "align", "explain", "review", "chat", "next", "done", "report", "serve")
@@ -74,7 +72,7 @@ DEFAULT_NOTES_DIR = Path("notes")
 DEFAULT_BOOKS_DIR = Path("books")
 DEFAULT_PROFILE_PATH = Path("profile") / "knowledge.md"
 DEFAULT_TASKS_PATH = Path("profile") / "tasks.md"
-DEFAULT_SYLLABUS_PATH = Path("profile") / "syllabus.md"
+# DEFAULT_SYLLABUS_PATH 来自 syllabus 模块（以前这里又定义了一份同值常量）
 
 # 链接里可能出现的文档路径前缀 → 是否需要走 wiki 解析
 _DOC_PATH_PREFIXES = ("wiki", "docx", "docs", "doc")
@@ -109,6 +107,90 @@ def _strip_quotes(raw: str) -> str:
     if text.endswith("'"):
         text = text[:-1]
     return text.strip()
+
+
+class _UsageError(Exception):
+    """命令行参数不合法：打印「原因 + 用法」并以退出码 2 结束。"""
+
+
+# 带值选项缺值时的提示（各命令共用一份，避免同一个选项在不同命令里说法不一）
+_OPTION_HINTS = {
+    "--profile": "画像文件路径",
+    "--provider": "provider 名（kimi / deepseek）",
+    "--state": "状态文件路径",
+    "--notes-dir": "目录",
+    "--stale-days": "天数",
+    "--topic": "主题名",
+    "--recite": "复述内容",
+    "--port": "端口号",
+    "--days": "天数",
+}
+
+
+def _usage_error(message: str) -> int:
+    print(message + "\n" + USAGE, file=sys.stderr)
+    return 2
+
+
+def _parse_args(
+    rest: list[str],
+    *,
+    values: tuple[str, ...] = (),
+    flags: tuple[str, ...] = (),
+    repeat: tuple[str, ...] = (),
+) -> tuple[dict, list[str]]:
+    """把参数拆成 (选项, 位置参数)。
+
+    - values：带一个值的选项（重复出现时最后一次生效），缺省为 None；
+    - repeat：可重复的带值选项，值收集成列表；
+    - flags：不带值的开关，出现即 True。
+    缺值时抛 _UsageError（文案取 _OPTION_HINTS）。其余参数原样进位置参数。
+    """
+    options: dict = {name: None for name in values}
+    options.update({name: [] for name in repeat})
+    options.update({name: False for name in flags})
+    positional: list[str] = []
+    index = 0
+    while index < len(rest):
+        item = rest[index]
+        if item in flags:
+            options[item] = True
+            index += 1
+            continue
+        if item in values or item in repeat:
+            if index + 1 >= len(rest):
+                raise _UsageError(f"{item} 后面要跟{_OPTION_HINTS.get(item, '一个值')}")
+            if item in repeat:
+                options[item].append(rest[index + 1])
+            else:
+                options[item] = rest[index + 1]
+            index += 2
+            continue
+        positional.append(item)
+        index += 1
+    return options, positional
+
+
+def _check_provider(provider: str | None) -> None:
+    """--provider 只认已知名字（kimi / moonshot / deepseek 及别名）。"""
+    if provider is not None and provider.strip().lower() not in PROVIDER_ALIASES:
+        raise _UsageError(f"未知的 provider：{provider}（可选：kimi、moonshot、deepseek）")
+
+
+def _profile_target(override: str | None, profile_path: Path | str | None) -> Path:
+    """画像文件路径：命令行 --profile 优先，其次调用方传入，最后默认 profile/knowledge.md。"""
+    if override:
+        return Path(override)
+    return Path(profile_path) if profile_path else DEFAULT_PROFILE_PATH
+
+
+def _completer_or_report(env_path, provider: str | None, home):
+    """建 LLM 客户端；配置有误时打印中文原因并返回 None（调用方退出码 1）。"""
+    try:
+        return make_llm_completer(env_path=env_path, provider=provider, home=home)
+    except LLMError as exc:
+        print(f"LLM 配置错误：{exc}", file=sys.stderr)
+        return None
 
 
 def make_transport() -> Transport:
@@ -167,14 +249,12 @@ def _force_utf8_stdio() -> None:
 
 def _run_sync(rest: list[str], env_path: Path | str, notes_dir: Path | str) -> int:
     if len(rest) != 1:
-        print("sync 需要且只需要一个参数：" + chr(10) + USAGE, file=sys.stderr)
-        return 2
+        return _usage_error("sync 需要且只需要一个参数：")
 
     try:
         token, maybe_wiki = parse_document_ref(rest[0])
     except ValueError as exc:
-        print(f"参数错误：{exc}" + chr(10) + USAGE, file=sys.stderr)
-        return 2
+        return _usage_error(f"参数错误：{exc}")
 
     try:
         credentials = load_credentials(env_path=env_path)
@@ -217,57 +297,25 @@ def _run_distill(
     profile_path: Path | str | None = None,
     notes_dir: Path | str = DEFAULT_NOTES_DIR,
 ) -> int:
-    as_json = "--json" in rest
-    write_profile = "--no-write" not in rest
-    all_notes = "--all" in rest
-    force = "--force" in rest
-    provider: str | None = None
-    profile_override: str | None = None
-    notes_override: str | None = None
-    state_override: str | None = None
-    remaining: list[str] = []
-    index = 0
-    while index < len(rest):
-        item = rest[index]
-        if item in ("--json", "--no-write", "--all", "--force"):
-            index += 1
-            continue
-        if item == "--state":
-            if index + 1 >= len(rest):
-                print("--state 后面要跟状态文件路径" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            state_override = rest[index + 1]
-            index += 2
-            continue
-        if item == "--notes-dir":
-            if index + 1 >= len(rest):
-                print("--notes-dir 后面要跟目录" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            notes_override = rest[index + 1]
-            index += 2
-            continue
-        if item == "--profile":
-            if index + 1 >= len(rest):
-                print("--profile 后面要跟画像文件路径" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            profile_override = rest[index + 1]
-            index += 2
-            continue
-        if item == "--provider":
-            if index + 1 >= len(rest):
-                print("--provider 后面要跟 provider 名（kimi / deepseek）" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            provider = rest[index + 1]
-            index += 2
-            continue
-        remaining.append(item)
-        index += 1
-    positional = remaining
+    try:
+        options, positional = _parse_args(
+            rest,
+            values=("--state", "--notes-dir", "--profile", "--provider"),
+            flags=("--json", "--no-write", "--all", "--force"),
+        )
+    except _UsageError as exc:
+        return _usage_error(str(exc))
+    as_json = options["--json"]
+    write_profile = not options["--no-write"]
+    force = options["--force"]
+    provider = options["--provider"]
+    profile_override = options["--profile"]
+    notes_override = options["--notes-dir"]
+    state_override = options["--state"]
 
-    if all_notes:
+    if options["--all"]:
         if positional:
-            print("--all 不能与笔记文件参数同时使用" + chr(10) + USAGE, file=sys.stderr)
-            return 2
+            return _usage_error("--all 不能与笔记文件参数同时使用")
         return _run_distill_all(
             env_path=env_path,
             home=home,
@@ -280,13 +328,11 @@ def _run_distill(
         )
 
     if len(positional) != 1:
-        print("distill 需要且只需要一个笔记文件参数" + chr(10) + USAGE, file=sys.stderr)
-        return 2
+        return _usage_error("distill 需要且只需要一个笔记文件参数")
 
     note_path = Path(positional[0])
     if not note_path.is_file():
-        print(f"找不到笔记文件：{note_path}" + chr(10) + USAGE, file=sys.stderr)
-        return 2
+        return _usage_error(f"找不到笔记文件：{note_path}")
 
     try:
         # errors="replace"：Windows 上笔记可能是 GBK，不能因为编码问题直接崩掉
@@ -295,17 +341,13 @@ def _run_distill(
         print(f"读取笔记失败：{note_path}（{type(exc).__name__}）", file=sys.stderr)
         return 1
 
-    if provider is not None and provider.strip().lower() not in PROVIDER_ALIASES:
-        print(
-            f"未知的 provider：{provider}（可选：kimi、moonshot、deepseek）" + chr(10) + USAGE,
-            file=sys.stderr,
-        )
-        return 2
-
     try:
-        completer = make_llm_completer(env_path=env_path, provider=provider, home=home)
-    except LLMError as exc:
-        print(f"LLM 配置错误：{exc}", file=sys.stderr)
+        _check_provider(provider)
+    except _UsageError as exc:
+        return _usage_error(str(exc))
+
+    completer = _completer_or_report(env_path, provider, home)
+    if completer is None:
         return 1
 
     try:
@@ -323,7 +365,7 @@ def _run_distill(
     print(format_points(points), file=sys.stderr)
 
     if write_profile:
-        target = Path(profile_override) if profile_override else Path(profile_path or DEFAULT_PROFILE_PATH)
+        target = _profile_target(profile_override, profile_path)
         try:
             # T-004：读旧画像 → 合并（同名去重、只升不降、证据追加）→ 临时文件替换
             current = KnowledgeProfile.load(target)
@@ -372,14 +414,13 @@ def _run_distill_all(
     state_file = Path(state_path) if state_path else (target.parent / DEFAULT_STATE_NAME)
     state = load_distill_state(state_file)
 
-    if provider is not None and provider.strip().lower() not in PROVIDER_ALIASES:
-        print(f"未知的 provider：{provider}" + chr(10) + USAGE, file=sys.stderr)
-        return 2
-
     try:
-        completer = make_llm_completer(env_path=env_path, provider=provider, home=home)
-    except LLMError as exc:
-        print(f"LLM 配置错误：{exc}", file=sys.stderr)
+        _check_provider(provider)
+    except _UsageError as exc:
+        return _usage_error(str(exc))
+
+    completer = _completer_or_report(env_path, provider, home)
+    if completer is None:
         return 1
 
     def report(position: int, total: int, name: str, status: str) -> None:
@@ -423,66 +464,29 @@ def _run_next(
     topic_list: list[str] | None = None,
     weaknesses: list[str] | None = None,
 ) -> int:
-    positional: list[str] = []
-    profile_override: str | None = None
-    provider: str | None = None
-    # T-029：--topic 可重复；看板走 topic_list（已解析好的列表）
-    topics: list[str] = list(topic_list or [])
-    # T-035：多久没碰算"该复习了"，默认 14 天，可配
-    stale_days = DEFAULT_STALE_DAYS
-    index = 0
-    while index < len(rest):
-        item = rest[index]
-        if item == "--stale-days":
-            if index + 1 >= len(rest):
-                print("--stale-days 后面要跟天数" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            try:
-                stale_days = int(rest[index + 1])
-            except ValueError:
-                print(f"--stale-days 必须是整数：{rest[index + 1]}" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            if stale_days < 0:
-                print("--stale-days 不能是负数" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            index += 2
-            continue
-        if item == "--topic":
-            if index + 1 >= len(rest):
-                print("--topic 后面要跟主题名" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            topics.append(rest[index + 1])
-            index += 2
-            continue
-        if item == "--profile":
-            if index + 1 >= len(rest):
-                print("--profile 后面要跟画像文件路径" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            profile_override = rest[index + 1]
-            index += 2
-            continue
-        if item == "--provider":
-            if index + 1 >= len(rest):
-                print("--provider 后面要跟 provider 名（kimi / deepseek）" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            provider = rest[index + 1]
-            index += 2
-            continue
-        positional.append(item)
-        index += 1
-
-    if positional:
-        print("next 不需要位置参数" + chr(10) + USAGE, file=sys.stderr)
-        return 2
-
-    if provider is not None and provider.strip().lower() not in PROVIDER_ALIASES:
-        print(
-            f"未知的 provider：{provider}（可选：kimi、moonshot、deepseek）" + chr(10) + USAGE,
-            file=sys.stderr,
+    try:
+        options, positional = _parse_args(
+            rest, values=("--stale-days", "--profile", "--provider"), repeat=("--topic",)
         )
-        return 2
+        if positional:
+            raise _UsageError("next 不需要位置参数")
+        _check_provider(options["--provider"])
+        # T-035：多久没碰算"该复习了"，默认 14 天，可配
+        stale_days = DEFAULT_STALE_DAYS
+        if options["--stale-days"] is not None:
+            try:
+                stale_days = int(options["--stale-days"])
+            except ValueError:
+                raise _UsageError(f"--stale-days 必须是整数：{options['--stale-days']}") from None
+            if stale_days < 0:
+                raise _UsageError("--stale-days 不能是负数")
+    except _UsageError as exc:
+        return _usage_error(str(exc))
+    provider = options["--provider"]
+    # T-029：--topic 可重复；看板走 topic_list（已解析好的列表）
+    topics: list[str] = list(topic_list or []) + options["--topic"]
 
-    target = Path(profile_override) if profile_override else Path(profile_path or DEFAULT_PROFILE_PATH)
+    target = _profile_target(options["--profile"], profile_path)
     if not target.is_file():
         # T-017 I-3：缺前置产物统一退 1（与 done 一致），并指明下一步
         print(f"找不到画像文件：{target}：先运行 sync 同步笔记，再运行 distill --all 生成画像", file=sys.stderr)
@@ -543,10 +547,8 @@ def _run_next(
         break
 
     if task is None:
-        try:
-            completer = make_llm_completer(env_path=env_path, provider=provider, home=home)
-        except LLMError as exc:
-            print(f"LLM 配置错误：{exc}", file=sys.stderr)
+        completer = _completer_or_report(env_path, provider, home)
+        if completer is None:
             return 1
 
         try:
@@ -591,41 +593,23 @@ def _run_import(
     books_dir: Path | str | None = None,
     syllabus_path: Path | str | None = None,
 ) -> int:
-    provider: str | None = None
-    positional: list[str] = []
-    index = 0
-    while index < len(rest):
-        item = rest[index]
-        if item == "--provider":
-            if index + 1 >= len(rest):
-                print("--provider 后面要跟 provider 名" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            provider = rest[index + 1]
-            index += 2
-            continue
-        positional.append(item)
-        index += 1
-
-    if len(positional) != 1:
-        print("import 需要且只需要一个书名文件名参数" + chr(10) + USAGE, file=sys.stderr)
-        return 2
-
-    if provider is not None and provider.strip().lower() not in PROVIDER_ALIASES:
-        print(f"未知的 provider：{provider}" + chr(10) + USAGE, file=sys.stderr)
-        return 2
+    try:
+        options, positional = _parse_args(rest, values=("--provider",))
+        if len(positional) != 1:
+            raise _UsageError("import 需要且只需要一个书名文件名参数")
+        _check_provider(options["--provider"])
+    except _UsageError as exc:
+        return _usage_error(str(exc))
 
     books = Path(books_dir or DEFAULT_BOOKS_DIR)
     source = Path(positional[0])
     if not source.is_absolute():
         source = books / source
     if not source.is_file():
-        print(f"找不到蒸馏稿：{source}（请把蒸馏稿放进 {books}）" + chr(10) + USAGE, file=sys.stderr)
-        return 2
+        return _usage_error(f"找不到蒸馏稿：{source}（请把蒸馏稿放进 {books}）")
 
-    try:
-        completer = make_llm_completer(env_path=env_path, provider=provider, home=home)
-    except LLMError as exc:
-        print(f"LLM 配置错误：{exc}", file=sys.stderr)
+    completer = _completer_or_report(env_path, options["--provider"], home)
+    if completer is None:
         return 1
 
     # T-010：长稿分块提炼——逐块打印进度，避免几百秒黑屏（与 distill 一致的手感）
@@ -688,12 +672,8 @@ def _build_board(
         命令的 stderr（逐篇成败汇总等）也一并捕获：看板要把结果给人看，不能只报"退出码 1"。
         """
         out_buf, err_buf = io.StringIO(), io.StringIO()
-        saved_out, saved_err = sys.stdout, sys.stderr
-        sys.stdout, sys.stderr = out_buf, err_buf
-        try:
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
             code = runner()
-        finally:
-            sys.stdout, sys.stderr = saved_out, saved_err
         text = "\n".join(part.strip() for part in (out_buf.getvalue(), err_buf.getvalue()) if part.strip())
         if code != 0:
             raise RuntimeError(f"退出码 {code}" + (f"\n{text}" if text else ""))
@@ -776,34 +756,13 @@ def _build_board(
         )
 
     def op_done(name: str, path: str, recite: str = "") -> str:
-        # T-024 M-01：看板回写表单补齐了 name/path/recite 三个入参
+        # T-024 M-01：看板回写表单补齐了 name/path/recite 三个入参。
+        # T-035 的「做掉就从错题本移除」由 _run_done 负责（CLI 与看板同一条路径，
+        # 以前这里又手写了一遍同样的移除逻辑——_run_done 已经移完，那一遍永远是空操作）。
         args = [str(name), str(path)]
         if str(recite or "").strip():
             args += ["--recite", str(recite).strip()]
-        output = capture(lambda: _run_done(args, profile_path=target))
-        # T-035：把这个知识点相关的薄弱点从错题本移除（做掉了就不该再挂着）。
-        # 注意用**解析后的点全名**去匹配：用户可能只写「列表」，而画像里是「列表（ul/ol/li）」。
-        try:
-            from .profile import normalize_point_name
-            from .weaknesses import load_weaknesses, remove_weaknesses
-
-            wanted = {normalize_point_name(str(name))}
-            try:
-                lookup = KnowledgeProfile.load(target)
-                for candidate in [str(name), normalize_point_name(str(name))]:
-                    found = lookup.find(candidate)
-                    if found is not None:
-                        wanted.add(found.name)
-            except Exception:
-                pass
-            wanted.discard("")
-            hit = [w.text for w in load_weaknesses(target.parent) if any(word in w.text for word in wanted)]
-            if hit:
-                remove_weaknesses(target.parent, hit)
-                output += "\n（已从错题本移除：" + "、".join(hit) + "）"
-        except Exception:
-            pass
-        return output
+        return capture(lambda: _run_done(args, profile_path=target))
 
     def _terminal_launcher():
         """弹终端用的发射器（单独抽出来便于测试打桩）。"""
@@ -973,8 +932,6 @@ def _build_board(
             "之后在面板里直接打字追问即可；回答渲染回面板，不刷新页面、不跳滚动。",
             "对话按任务隔离，留档到同名 .chat.md。",
             "",
-            "该文件包含：任务卡 / 本次提交的代码 / 画像相关点 / 书籍出处与章节 / 提问引导。",
-            "",
         ]
         if launched:
             lines.extend(
@@ -1002,32 +959,27 @@ def _build_board(
         lines.extend(
             [
                 "",
-                f"【不想开图形界面】命令行一次性问也行：",
+                "【不想开图形界面】命令行一次性问也行：",
                 f'  dsh --profile headless "读 {shown}，回答其中的提问"',
             ]
         )
         return "\n".join(lines)
 
     def op_review(task: str, code: str) -> str:
-        # T-028：按验收方式点评，并把「提交时间 + 评价 + 建议」留档到对应任务块
-        from .planner import PlannerError, append_review, read_task_records
-        from .review import ReviewError, review_code
+        # T-028：按验收方式点评，并把「提交时间 + 评价 + 建议」留档到对应任务块；
+        # T-035：问题点并进错题本——与 CLI review 走同一个 _review_and_record
+        # （以前看板这条路径漏了错题本，只有命令行 review 会记）。
+        from .planner import PlannerError
+        from .review import ReviewError
 
-        entry = next((r for r in read_task_records(record) if r.when == task), None)
-        if entry is None:
+        # 先确认任务存在再建 LLM 客户端：时间戳写错时报「没有这个任务」，而不是先报 LLM 配置问题
+        if _find_task(record, task) is None:
             raise RuntimeError(f"任务记录里没有时间戳为「{task}」的块")
-        completer = make_llm_completer(env_path=env_path, home=home)
         try:
-            result = review_code(
-                goal=entry.goal, acceptance=entry.acceptance, code=code, completer=completer
-            )
-            append_review(
-                record, task, code=result.code, feedback=result.feedback,
-                suggestion=result.suggestion, truncated=result.truncated,
-            )
-        except (ReviewError, PlannerError) as exc:
+            completer = make_llm_completer(env_path=env_path, home=home)
+            return _review_and_record(record, task, code, completer).render()
+        except (ReviewError, PlannerError, LLMError) as exc:
             raise RuntimeError(str(exc)) from None
-        return result.render()
 
     def op_delete_task(when: str) -> str:
         # T-027：按时间戳删掉一个任务块（只动目标块，临时文件 + 替换）
@@ -1040,16 +992,15 @@ def _build_board(
         return f"已删除任务 {when}"
 
     def op_explain(name: str) -> str:
-        # T-022：看板「讲解」按钮 → 同一个 explain 命令
+        # T-022：看板「讲解」按钮 → 同一个 explain 命令（notes_dir 可能是 str，统一转 Path）
+        books_dir = Path(notes_dir).parent / DEFAULT_BOOKS_DIR.name
         return capture(
-            lambda: _run_explain(
-                [str(name)], env_path, home=home, profile_path=target, books_dir=notes_dir.parent / "books"
-            )
+            lambda: _run_explain([str(name)], env_path, home=home, profile_path=target, books_dir=books_dir)
         )
 
     return TaskBoard(
         target.parent,
-        operations={
+        operations={  # 固定动作集：键必须与 dashboard.FIXED_ACTIONS 一一对应
             "sync": op_sync,
             "distill": op_distill,
             "next": op_next,
@@ -1073,39 +1024,22 @@ def _run_serve(
 ) -> int:
     from .dashboard import build_server
 
-    port_text: str | None = None
-    open_browser = "--no-browser" not in rest
-    positional: list[str] = []
-    index = 0
-    while index < len(rest):
-        item = rest[index]
-        if item == "--no-browser":
-            index += 1
-            continue
-        if item == "--port":
-            if index + 1 >= len(rest):
-                print("--port 后面要跟端口号" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            port_text = rest[index + 1]
-            index += 2
-            continue
-        positional.append(item)
-        index += 1
-
-    if positional:
-        print("serve 不需要位置参数" + chr(10) + USAGE, file=sys.stderr)
-        return 2
-
-    port = DEFAULT_SERVE_PORT
-    if port_text is not None:
-        try:
-            port = int(port_text)
-        except ValueError:
-            print(f"端口必须是数字：{port_text}" + chr(10) + USAGE, file=sys.stderr)
-            return 2
-        if not (0 <= port <= 65535):
-            print(f"端口超出范围：{port}" + chr(10) + USAGE, file=sys.stderr)
-            return 2
+    try:
+        options, positional = _parse_args(rest, values=("--port",), flags=("--no-browser",))
+        if positional:
+            raise _UsageError("serve 不需要位置参数")
+        port = DEFAULT_SERVE_PORT
+        port_text = options["--port"]
+        if port_text is not None:
+            try:
+                port = int(port_text)
+            except ValueError:
+                raise _UsageError(f"端口必须是数字：{port_text}") from None
+            if not (0 <= port <= 65535):
+                raise _UsageError(f"端口超出范围：{port}")
+    except _UsageError as exc:
+        return _usage_error(str(exc))
+    open_browser = not options["--no-browser"]
 
     target = Path(profile_path or DEFAULT_PROFILE_PATH)
     profile_dir = target.parent if target.name.endswith(".md") else target
@@ -1158,92 +1092,62 @@ def _run_done(
     rest: list[str],
     profile_path: Path | str | None = None,
 ) -> int:
-    profile_override: str | None = None
-    recite = ""
-    positional: list[str] = []
-    index = 0
-    while index < len(rest):
-        item = rest[index]
-        if item == "--profile":
-            if index + 1 >= len(rest):
-                print("--profile 后面要跟画像文件路径" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            profile_override = rest[index + 1]
-            index += 2
-            continue
-        if item == "--recite":
-            # T-019：费曼复述。带了它就把状态升到「输出」。
-            if index + 1 >= len(rest):
-                print("--recite 后面要跟复述内容" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            recite = rest[index + 1]
-            index += 2
-            continue
-        positional.append(item)
-        index += 1
-
-    if len(positional) != 2:
-        print(
-            "done 需要两个参数：<知识点> <产出路径>" + chr(10) + USAGE,
-            file=sys.stderr,
-        )
-        return 2
+    try:
+        # T-019：--recite 是费曼复述。带了它就把状态升到「输出」。
+        options, positional = _parse_args(rest, values=("--profile", "--recite"))
+        if len(positional) != 2:
+            raise _UsageError("done 需要两个参数：<知识点> <产出路径>")
+    except _UsageError as exc:
+        return _usage_error(str(exc))
+    recite = options["--recite"] or ""
 
     name, product = positional
-    target = Path(profile_override) if profile_override else Path(profile_path or DEFAULT_PROFILE_PATH)
+    target = _profile_target(options["--profile"], profile_path)
     if not target.is_file():
         print(f"找不到画像文件：{target}：先运行 sync + distill", file=sys.stderr)
         return 1
 
     try:
-        profile = KnowledgeProfile.load(target)
-        updated = mark_done(profile, name, product, recite=recite)
-        # T-035：回写也算"碰过"这个知识点，刷新 last_touched（复习队列靠它）。
-        # 名字要用**解析后的点全名**：用户可能只写「列表」，画像里却是「列表（ul/ol/li）」，
-        # 只传缩略名的话 touch_points 匹配不上，时间戳就永远不刷新（实测踩过）。
-        # 名字用**回写后那句提示里的真实点名**（mark_done 已经解析过歧义/缩略名）。
-        # 直接 find(normalize_point_name(name)) 是不行的：这里是精确匹配，
-        # 「列表」匹配不到「列表（ul/ol/li）」，时间戳就永远刷不新（实测踩过）。
-        touched_names = [normalize_point_name(name)]
-        try:
-            from .profile import _resolve_point_index
-
-            index = _resolve_point_index(list(updated.points), name)
-            touched_names.append(updated.points[index].name)
-        except Exception:
-            pass
-        updated = touch_points(updated, touched_names)
+        updated = mark_done(KnowledgeProfile.load(target), name, product, recite=recite)
+        # 用户可能只写缩略名「列表」，画像里却是「列表（ul/ol/li）」：后面刷时间戳、
+        # 清错题本都要用**解析后的完整点名**（mark_done 已经按同一规则解析过歧义/缩略名），
+        # 只用缩略名做精确匹配的话永远对不上（实测踩过两次）。
+        full_name = resolve_point_name(updated, name)
+        # T-035：回写也算"碰过"这个知识点，刷新 last_touched（复习队列靠它）
+        updated = touch_points(updated, [normalize_point_name(name), full_name or ""])
         write_profile_atomic(target, updated)
     except ProfileError as exc:
         print(f"回写失败（画像未改动）：{exc}", file=sys.stderr)
         return 1
 
-    # T-035：done 涉及的知识点相关薄弱点要从错题本移除（CLI 与看板等价）。
-    # 名字要用**解析后的点全名**去匹配：「列表」匹配不到「列表（ul/ol/li）」（实测踩过）。
-    try:
-        from .profile import _resolve_point_index
-        from .weaknesses import load_weaknesses, remove_weaknesses
+    # T-035：done 涉及的知识点相关薄弱点要从错题本移除（CLI 与看板共用这一处）
+    removed = _forget_weaknesses(target.parent, {normalize_point_name(name), str(name).strip(), full_name or ""})
+    if removed:
+        print("（已从错题本移除：" + "、".join(removed) + "）", file=sys.stderr)
 
-        wanted = {normalize_point_name(name), str(name).strip()}
-        try:
-            wanted.add(updated.points[_resolve_point_index(list(updated.points), name)].name)
-        except Exception:
-            pass
-        wanted.discard("")
-        hit = [w.text for w in load_weaknesses(target.parent) if any(word in w.text for word in wanted)]
-        if hit:
-            remove_weaknesses(target.parent, hit)
-            print("（已从错题本移除：" + "、".join(hit) + "）", file=sys.stderr)
-    except Exception:
-        pass  # 错题本坏了不该挡住回写
-
-    point = updated.find(normalize_point_name(name)) or updated.points[0]
+    point = updated.find(full_name or normalize_point_name(name))
+    shown, evidence = (point.name, point.evidence) if point else (str(name).strip(), "")
     if recite:
-        print(f"已把「{point.name}」升为「输出」（含费曼复述），证据：{point.evidence}", file=sys.stderr)
+        print(f"已把「{shown}」升为「输出」（含费曼复述），证据：{evidence}", file=sys.stderr)
     else:
-        print(f"已把「{point.name}」标记为「做过」，证据：{point.evidence}", file=sys.stderr)
+        print(f"已把「{shown}」标记为「做过」，证据：{evidence}", file=sys.stderr)
     print(f"已更新画像 {target}", file=sys.stderr)
     return 0
+
+
+def _forget_weaknesses(profile_dir: Path, names: set[str]) -> list[str]:
+    """把文本里提到这些知识点的薄弱点从错题本移除，返回移除的条目。
+
+    错题本坏了不该挡住回写：任何异常都只当"什么也没移除"。
+    """
+    from .weaknesses import load_weaknesses, remove_weaknesses
+
+    wanted = {name for name in names if name}
+    try:
+        hit = [item.text for item in load_weaknesses(profile_dir) if any(word in item.text for word in wanted)]
+        return remove_weaknesses(profile_dir, hit) if hit else []
+    except Exception:
+        return []
 
 
 def _run_report(
@@ -1255,41 +1159,22 @@ def _run_report(
     """T-044：周报复盘——把窗口内的学习活动汇总成 markdown。"""
     from .report import DEFAULT_DAYS, build_report
 
-    days = DEFAULT_DAYS
-    profile_override: str | None = None
-    index = 0
-    while index < len(rest):
-        item = rest[index]
-        if item == "--days":
-            if index + 1 >= len(rest):
-                print("--days 后面要跟天数" + chr(10) + USAGE, file=sys.stderr)
-                return 2
+    try:
+        options, positional = _parse_args(rest, values=("--days", "--profile"))
+        if positional:
+            raise _UsageError(f"report 不认识参数：{positional[0]}")
+        days = DEFAULT_DAYS
+        if options["--days"] is not None:
             try:
-                days = int(rest[index + 1])
+                days = int(options["--days"])
             except ValueError:
-                print(
-                    f"--days 必须是整数（收到 {rest[index + 1]}）" + chr(10) + USAGE,
-                    file=sys.stderr,
-                )
-                return 2
+                raise _UsageError(f"--days 必须是整数（收到 {options['--days']}）") from None
             if days < 1:
-                print("--days 必须 >= 1" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            index += 2
-            continue
-        if item == "--profile":
-            if index + 1 >= len(rest):
-                print("--profile 后面要跟画像文件路径" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            profile_override = rest[index + 1]
-            index += 2
-            continue
-        print(f"report 不认识参数：{item}" + chr(10) + USAGE, file=sys.stderr)
-        return 2
+                raise _UsageError("--days 必须 >= 1")
+    except _UsageError as exc:
+        return _usage_error(str(exc))
 
-    target = Path(profile_override) if profile_override else (
-        Path(profile_path) if profile_path else DEFAULT_PROFILE_PATH
-    )
+    target = _profile_target(options["--profile"], profile_path)
     if not target.is_file():
         print(f"找不到画像文件：{target}：先运行 sync + distill", file=sys.stderr)
         return 1
@@ -1304,6 +1189,7 @@ def _run_chat(
     env_path: Path | str = DEFAULT_ENV_PATH,
     *,
     profile_path: Path | str | None = None,
+    home: Path | str | None = None,
 ) -> int:
     """T-032：chat <任务时间戳> "问题" —— 终端接力，把答案透传到 stdout。
 
@@ -1311,36 +1197,22 @@ def _run_chat(
     """
     from .chat import ChatError, assemble_prompt, chat_once, find_dsh, read_handoff
 
-    positional: list[str] = []
-    profile_override: str | None = None
-    index = 0
-    while index < len(rest):
-        item = rest[index]
-        if item == "--profile":
-            # 和别的子命令一致：允许把画像路径当"项目根"用（handoff 就在它旁边）
-            if index + 1 >= len(rest):
-                print("--profile 后面要跟画像文件路径" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            profile_override = rest[index + 1]
-            index += 2
-            continue
-        if item in ("--provider", "--port"):
+    try:
+        # --profile：和别的子命令一致，允许把画像路径当"项目根"用（handoff 就在它旁边）
+        options, positional = _parse_args(rest, values=("--profile",))
+        unsupported = next((item for item in positional if item in ("--provider", "--port")), None)
+        if unsupported:
             # 这两个对 chat 没意义，提前报错免得被当成问题的一部分
-            print(f"chat 不支持 {item}" + chr(10) + USAGE, file=sys.stderr)
-            return 2
-        positional.append(item)
-        index += 1
-
-    # T-034：不带问题 → 进交互模式（REPL）；带问题 → 保持 T-032 单次模式
-    if len(positional) not in (1, 2):
-        print('chat 需要一个或两个参数：<任务时间戳> ["问题"]' + chr(10) + USAGE, file=sys.stderr)
-        return 2
+            raise _UsageError(f"chat 不支持 {unsupported}")
+        # T-034：不带问题 → 进交互模式（REPL）；带问题 → 保持 T-032 单次模式
+        if len(positional) not in (1, 2):
+            raise _UsageError('chat 需要一个或两个参数：<任务时间戳> ["问题"]')
+    except _UsageError as exc:
+        return _usage_error(str(exc))
 
     when = positional[0]
     question = positional[1] if len(positional) == 2 else None
-    target = Path(profile_override) if profile_override else (
-        Path(profile_path) if profile_path else DEFAULT_PROFILE_PATH
-    )
+    target = _profile_target(options["--profile"], profile_path)
 
     if question is None:
         # 交互模式：每轮把 handoff + 该任务历史 + 新消息拼成 prompt
@@ -1353,7 +1225,9 @@ def _run_chat(
         )
         from .repl import run_repl
 
-        # T-043：REPL 也一样——超长历史压成摘要并落盘缓存
+        # T-043：REPL 也一样——超长历史压成摘要并落盘缓存。
+        # （以前 _run_chat 没有 home 参数，这里的 home 是未定义名字：NameError 被下面的
+        #  except 吞掉，REPL 的摘要器从来没建成过，超长历史一律被硬裁。）
         try:
             repl_summarizer = build_summarizer(
                 make_llm_completer(env_path=env_path, home=home)
@@ -1413,8 +1287,8 @@ def _run_chat(
     if not executable:
         print(
             "找不到 dsh 命令：请先安装 DeepSeek Harness（npm i -g @deepseek-ai/dsh），"
-            "确认 dsh 在 PATH 里再试。" + chr(10)
-            + "（也可以直接照抄接力文件里的提问，手动贴进 DSH。）",
+            "确认 dsh 在 PATH 里再试。\n"
+            "（也可以直接照抄接力文件里的提问，手动贴进 DSH。）",
             file=sys.stderr,
         )
         return 1
@@ -1425,10 +1299,10 @@ def _run_chat(
     patch = headless_persona_override()
     if patch:
         print(
-            "提醒：headless profile 配了人设覆盖（" + patch + "），"
+            f"提醒：headless profile 配了人设覆盖（{patch}），"
             "它的 system prompt 会压过这份接力上下文——实测里它常会先自我介绍、"
-            "并要求你再贴一次材料，答案可能跑偏。" + chr(10)
-            + "    想要靠谱的答案：在看板的接力文件里复制提问，直接在 DSH 会话里问；"
+            "并要求你再贴一次材料，答案可能跑偏。\n"
+            "    想要靠谱的答案：在看板的接力文件里复制提问，直接在 DSH 会话里问；"
             "或把该 profile 的 personaPrefix 去掉。",
             file=sys.stderr,
         )
@@ -1467,30 +1341,19 @@ def _run_review(
     tasks_path: Path | str | None = None,
 ) -> int:
     """T-028：review <任务时间戳> <代码文件> —— 按验收方式点评并留档。"""
-    from .planner import PlannerError, append_review, read_task_records
-    from .review import ReviewError, review_code
+    from .planner import PlannerError
+    from .review import MAX_CODE_CHARS, ReviewError
 
-    provider: str | None = None
-    positional: list[str] = []
-    index = 0
-    while index < len(rest):
-        item = rest[index]
-        if item == "--provider":
-            if index + 1 >= len(rest):
-                print("--provider 后面要跟 provider 名（kimi / deepseek）" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            provider = rest[index + 1]
-            index += 2
-            continue
-        positional.append(item)
-        index += 1
-
-    if len(positional) != 2:
-        print("review 需要两个参数：<任务时间戳> <代码文件>" + chr(10) + USAGE, file=sys.stderr)
-        return 2
+    try:
+        options, positional = _parse_args(rest, values=("--provider",))
+        if len(positional) != 2:
+            raise _UsageError("review 需要两个参数：<任务时间戳> <代码文件>")
+        _check_provider(options["--provider"])
+    except _UsageError as exc:
+        return _usage_error(str(exc))
 
     when, code_source = positional
-    target = Path(profile_path) if profile_path else DEFAULT_PROFILE_PATH
+    target = _profile_target(None, profile_path)
     tasks = Path(tasks_path) if tasks_path else (target.parent / DEFAULT_TASKS_PATH.name)
 
     # 代码可以给文件路径；给了不存在的文件要明确报错，而不是当成代码内容
@@ -1508,28 +1371,13 @@ def _run_review(
     else:
         code = code_source
 
-    entry = next((r for r in read_task_records(tasks) if r.when == when), None)
-    if entry is None:
+    if _find_task(tasks, when) is None:
         print(f"任务记录里没有时间戳为「{when}」的块：{tasks}", file=sys.stderr)
         return 1
 
     try:
-        completer = make_llm_completer(provider=provider, env_path=env_path, home=home)
-        result = review_code(
-            goal=entry.goal, acceptance=entry.acceptance, code=code, completer=completer
-        )
-        append_review(
-            tasks, when, code=result.code, feedback=result.feedback,
-            suggestion=result.suggestion, truncated=result.truncated,
-        )
-        # T-035：把这次点评抽出的「问题点」并进错题本（最多 3 条，去重）
-        if getattr(result, "problems", None):
-            try:
-                from .weaknesses import merge_weaknesses
-
-                merge_weaknesses(tasks.parent, result.problems)
-            except Exception:
-                pass  # 错题本写失败不该让点评白做
+        completer = make_llm_completer(provider=options["--provider"], env_path=env_path, home=home)
+        result = _review_and_record(tasks, when, code, completer)
     except (ReviewError, LLMError) as exc:
         print(f"点评失败（未留档）：{exc}", file=sys.stderr)
         return 1
@@ -1539,9 +1387,49 @@ def _run_review(
 
     print(result.render())
     if result.truncated:
-        print(f"（代码超过 8000 字符，已截断后点评）", file=sys.stderr)
+        print(f"（代码超过 {MAX_CODE_CHARS} 字符，已截断后点评）", file=sys.stderr)
     print(f"已留档到 {tasks}（任务 {when}）", file=sys.stderr)
     return 0
+
+
+def _find_task(tasks_path: Path | str, when: str):
+    """按时间戳找任务记录（找不到返回 None）。"""
+    from .planner import read_task_records
+
+    return next((record for record in read_task_records(tasks_path) if record.when == when), None)
+
+
+def _review_and_record(tasks_path: Path, when: str, code: str, completer):
+    """点评 + 留档 + 并进错题本：CLI review 与看板「提交作业」共用这一条路径。
+
+    - 找不到任务块 → PlannerError；LLM 失败 → ReviewError（都还没写任何文件）；
+    - 留档失败 → PlannerError（任务记录未改动）；
+    - 错题本写失败不影响点评结果（点评不能白做）。
+    """
+    from .planner import PlannerError, append_review
+    from .review import review_code
+
+    entry = _find_task(tasks_path, when)
+    if entry is None:
+        raise PlannerError(f"任务记录里没有时间戳为「{when}」的块")
+    result = review_code(goal=entry.goal, acceptance=entry.acceptance, code=code, completer=completer)
+    append_review(
+        tasks_path,
+        when,
+        code=result.code,
+        feedback=result.feedback,
+        suggestion=result.suggestion,
+        truncated=result.truncated,
+    )
+    # T-035：把这次点评抽出的「问题点」并进错题本（最多 3 条，去重）
+    if result.problems:
+        try:
+            from .weaknesses import merge_weaknesses
+
+            merge_weaknesses(Path(tasks_path).parent, result.problems)
+        except Exception:
+            pass  # 错题本写失败不该让点评白做
+    return result
 
 
 def _run_explain(
@@ -1554,31 +1442,13 @@ def _run_explain(
     """T-022：讲解一个知识点（地图定位 → 取参考文本 → LLM 讲解）。"""
     from .explain import DEFAULT_SRC_DIR, ExplainError, default_cache_dir, explain_point
 
-    provider: str | None = None
-    refresh = "--refresh" in rest
-    positional: list[str] = []
-    index = 0
-    while index < len(rest):
-        item = rest[index]
-        if item == "--refresh":
-            index += 1
-            continue
-        if item == "--provider":
-            if index + 1 >= len(rest):
-                print("--provider 后面要跟 provider 名（kimi / deepseek）" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            provider = rest[index + 1]
-            index += 2
-            continue
-        positional.append(item)
-        index += 1
-
-    if len(positional) != 1:
-        print("explain 需要且只需要一个知识点参数" + chr(10) + USAGE, file=sys.stderr)
-        return 2
-    if provider is not None and provider.strip().lower() not in PROVIDER_ALIASES:
-        print(f"未知的 provider：{provider}" + chr(10) + USAGE, file=sys.stderr)
-        return 2
+    try:
+        options, positional = _parse_args(rest, values=("--provider",), flags=("--refresh",))
+        if len(positional) != 1:
+            raise _UsageError("explain 需要且只需要一个知识点参数")
+        _check_provider(options["--provider"])
+    except _UsageError as exc:
+        return _usage_error(str(exc))
 
     target = Path(profile_path or DEFAULT_PROFILE_PATH)
     books_map = _load_syllabus(target.parent / DEFAULT_SYLLABUS_PATH.name)
@@ -1589,10 +1459,8 @@ def _run_explain(
         )
         return 1
 
-    try:
-        completer = make_llm_completer(env_path=env_path, provider=provider, home=home)
-    except LLMError as exc:
-        print(f"LLM 配置错误：{exc}", file=sys.stderr)
+    completer = _completer_or_report(env_path, options["--provider"], home)
+    if completer is None:
         return 1
 
     profile = KnowledgeProfile.load(target) if target.is_file() else None
@@ -1606,7 +1474,7 @@ def _run_explain(
             profile=profile,
             alignment_path=target.parent / DEFAULT_ALIGNMENT_NAME,
             cache_dir=default_cache_dir(target.parent),
-            refresh=refresh,
+            refresh=options["--refresh"],
         )
     except ExplainError as exc:
         print(f"讲解失败：{exc}", file=sys.stderr)
@@ -1615,23 +1483,14 @@ def _run_explain(
     print(result.render())
     return 0
 
+
+
 def _read_env_value(env_path: Path | str, key: str) -> str:
-    """从 .env 里读一个可选配置项（不涉及凭证，读不到就返回空串）。"""
-    target = Path(env_path)
-    if not Path(env_path).is_file():
-        return ""
-    try:
-        text = Path(env_path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        name, _, value = line.partition("=")
-        if name.strip() == key:
-            return value.strip().strip('"').strip("'")
-    return ""
+    """从 .env 里读一个可选配置项（不涉及凭证，读不到就返回空串）。
+
+    与凭证读取共用 credentials.parse_env_file 的解析规则（以前这里手写了第三份 .env 解析）。
+    """
+    return str(read_env_values(env_path).get(key, "")).strip()
 
 
 def _run_align(
@@ -1641,27 +1500,13 @@ def _run_align(
     profile_path: Path | str | None = None,
 ) -> int:
     """T-021：把知识地图里的细粒度点名对齐到画像的既有概念，结果落盘 alignment.json。"""
-    provider: str | None = None
-    positional: list[str] = []
-    index = 0
-    while index < len(rest):
-        item = rest[index]
-        if item == "--provider":
-            if index + 1 >= len(rest):
-                print("--provider 后面要跟 provider 名（kimi / deepseek）" + chr(10) + USAGE, file=sys.stderr)
-                return 2
-            provider = rest[index + 1]
-            index += 2
-            continue
-        positional.append(item)
-        index += 1
-
-    if positional:
-        print("align 不接受位置参数" + chr(10) + USAGE, file=sys.stderr)
-        return 2
-    if provider is not None and provider.strip().lower() not in PROVIDER_ALIASES:
-        print(f"未知的 provider：{provider}" + chr(10) + USAGE, file=sys.stderr)
-        return 2
+    try:
+        options, positional = _parse_args(rest, values=("--provider",))
+        if positional:
+            raise _UsageError("align 不接受位置参数")
+        _check_provider(options["--provider"])
+    except _UsageError as exc:
+        return _usage_error(str(exc))
 
     from .alignment import align_points, save_alignment, summary
 
@@ -1694,10 +1539,8 @@ def _run_align(
         print("知识地图里没有知识点，无需对齐", file=sys.stderr)
         return 0
 
-    try:
-        completer = make_llm_completer(env_path=env_path, provider=provider, home=home)
-    except LLMError as exc:
-        print(f"LLM 配置错误：{exc}", file=sys.stderr)
+    completer = _completer_or_report(env_path, options["--provider"], home)
+    if completer is None:
         return 1
 
     print(
@@ -1726,6 +1569,7 @@ def _run_align(
     )
     print(f"已写入 {destination}", file=sys.stderr)
     return 0
+
 
 def _load_syllabus(path: Path):
     """读取知识地图，返回 **BookMap 列表**（T-010 定稿：markdown 格式）。
@@ -1771,77 +1615,37 @@ def main(
 
     command, rest = args[0], args[1:]
 
-    if command == "sync":
-        return _run_sync(rest, env_path, notes_dir)
-    if command == "distill":
-        return _run_distill(
-            rest, env_path, home=home, profile_path=profile_path, notes_dir=notes_dir
-        )
-    if command == "next":
+    def run_next() -> int:
         # T-035：CLI 与看板走同一条路——都带上错题本
         from .weaknesses import weaknesses_text
 
-        profile_target = Path(profile_path) if profile_path else DEFAULT_PROFILE_PATH
         try:
-            complaints = weaknesses_text(profile_target.parent)
+            complaints = weaknesses_text(_profile_target(None, profile_path).parent)
         except Exception:
             complaints = []
         return _run_next(
-            rest,
-            env_path,
-            home=home,
-            profile_path=profile_path,
-            tasks_path=tasks_path,
-            weaknesses=complaints,
-        )
-    if command == "done":
-        return _run_done(rest, profile_path=profile_path)
-    if command == "report":
-        return _run_report(rest, profile_path=profile_path)
-    if command == "serve":
-        return _run_serve(
-            rest,
-            profile_path=profile_path,
-            env_path=env_path,
-            notes_dir=notes_dir,
-            tasks_path=tasks_path,
-            home=home,
-        )
-    if command == "import":
-        return _run_import(
-            rest,
-            env_path,
-            home=home,
-            books_dir=books_dir,
-            syllabus_path=syllabus_path,
-        )
-    if command == "align":
-        return _run_align(rest, env_path, home=home, profile_path=profile_path)
-    if command == "chat":
-        return _run_chat(
-            rest,
-            env_path,
-            profile_path=profile_path,
-        )
-    if command == "review":
-        return _run_review(
-            rest,
-            env_path,
-            home=home,
-            profile_path=profile_path,
-            tasks_path=tasks_path,
-        )
-    if command == "explain":
-        return _run_explain(
-            rest,
-            env_path,
-            home=home,
-            profile_path=profile_path,
-            books_dir=books_dir,
+            rest, env_path, home=home, profile_path=profile_path, tasks_path=tasks_path, weaknesses=complaints
         )
 
-    print(f"未知命令：{command}" + chr(10) + USAGE, file=sys.stderr)
-    return 2
+    handlers = {
+        "sync": lambda: _run_sync(rest, env_path, notes_dir),
+        "distill": lambda: _run_distill(rest, env_path, home=home, profile_path=profile_path, notes_dir=notes_dir),
+        "next": run_next,
+        "done": lambda: _run_done(rest, profile_path=profile_path),
+        "report": lambda: _run_report(rest, profile_path=profile_path),
+        "serve": lambda: _run_serve(
+            rest, profile_path=profile_path, env_path=env_path, notes_dir=notes_dir, tasks_path=tasks_path, home=home
+        ),
+        "import": lambda: _run_import(rest, env_path, home=home, books_dir=books_dir, syllabus_path=syllabus_path),
+        "align": lambda: _run_align(rest, env_path, home=home, profile_path=profile_path),
+        "chat": lambda: _run_chat(rest, env_path, profile_path=profile_path, home=home),
+        "review": lambda: _run_review(rest, env_path, home=home, profile_path=profile_path, tasks_path=tasks_path),
+        "explain": lambda: _run_explain(rest, env_path, home=home, profile_path=profile_path, books_dir=books_dir),
+    }
+    handler = handlers.get(command)
+    if handler is None:
+        return _usage_error(f"未知命令：{command}")
+    return handler()
 
 
 if __name__ == "__main__":

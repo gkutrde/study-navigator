@@ -26,8 +26,9 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
+from .fileio import write_text_atomic
 from .planner import TaskRecord
-from .profile import KnowledgeProfile, normalize_point_name
+from .profile import MASTERED_LEVELS, KnowledgeProfile, normalize_point_name
 from .review import MAX_CODE_CHARS, prepare_code
 from .syllabus import BookMap
 
@@ -63,9 +64,6 @@ SECTION_HEADINGS = (
     SECTION_BOOKS,
     SECTION_QUESTIONS,
 )
-
-# 「已掌握」口径与 planner/review 一致：存疑不算已掌握
-MASTERED_LEVELS = ("学过", "做过", "输出")
 
 NO_TASK_RECORD = "（找不到任务记录：任务卡内容缺失，请在看板上从任务卡片重新进入）"
 NO_TIMESTAMP = "（没有任务时间戳）"
@@ -150,10 +148,8 @@ def _find_map_location(point: str, books: list[BookMap] | None):
     text = _clean(point)
     if not text:
         return None
-    try:
-        from .explain import _find_point_in_books
-    except ImportError:  # pragma: no cover - 理论上不会发生
-        return None
+    from .explain import _find_point_in_books
+
     try:
         return _find_point_in_books(text, books)
     except Exception:  # 地图格式再怪也不该让接力文件生成失败
@@ -355,16 +351,7 @@ def write_handoff(
     stamp = _clean(when) or (_clean(record.when) if record is not None else "")
     path = handoff_path(profile_dir, stamp)
     text = build_handoff_markdown(record, when=stamp, code=code, profile=profile, books=books)
-
-    tmp = path.with_name(path.name + ".tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(text, encoding="utf-8")
-        tmp.replace(path)
+        return write_text_atomic(path, text)
     except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise HandoffError(f"写入接力上下文失败：{path}（{type(exc).__name__}）") from None
-    return path

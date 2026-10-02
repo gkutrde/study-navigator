@@ -14,14 +14,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-import json
 from pathlib import Path
 import re
 from typing import Sequence
 
 from .distill import KnowledgePoint
-from .llm import LLMError
-from .profile import KnowledgeProfile
+from .fileio import read_text_or_none, write_text_atomic
+from .llm import JSONExtractionError, LLMError, extract_json
+from .profile import DEFAULT_TOPIC, MASTERED_LEVELS, KnowledgeProfile
 
 MIN_POINTS = 3
 MAX_NEW_SKILLS = 1
@@ -30,7 +30,22 @@ MAX_PROFILE_IN_PROMPT = 40
 MAX_UNCERTAIN_IN_PROMPT = 10
 DEFAULT_LANGUAGE = "Python"
 
-MASTERED_LEVELS = ("学过", "做过")
+# 「未分类」主题：与画像同一个常量（以前两边各写一份字面量）
+UNCLASSIFIED_TOPIC = DEFAULT_TOPIC
+
+
+def _topic_of(point) -> str:
+    """知识点所属主题；空主题归「未分类」（主题过滤、看板多选、选点都按这个口径）。"""
+    return (point.topic or UNCLASSIFIED_TOPIC).strip() or UNCLASSIFIED_TOPIC
+
+
+def _book_points(book) -> set[str]:
+    """一本书里出现过的全部点名（去首尾空白）。"""
+    return {
+        str(point).strip()
+        for chapter in getattr(book, "chapters", []) or []
+        for point in getattr(chapter, "points", []) or []
+    }
 
 
 class PlannerError(RuntimeError):
@@ -92,11 +107,7 @@ def describe_profile(profile: KnowledgeProfile, limit: int | None = None) -> str
     points = profile.points if limit is None else profile.points[:limit]
     if not points:
         return "（画像为空）"
-    lines = []
-    for point in points:
-        topic = point.topic or "未分类"
-        lines.append(f"- {point.name}（{topic}）：{point.level}")
-    return "\n".join(lines)
+    return "\n".join(f"- {point.name}（{point.topic or UNCLASSIFIED_TOPIC}）：{point.level}" for point in points)
 
 
 def describe_syllabus(syllabus: dict | None) -> str:
@@ -256,8 +267,7 @@ def _point_in_topics(point_name: str, allowed: set[str], profile: KnowledgeProfi
         return False
     for point in profile.points:
         if point.name == name:
-            topic = (point.topic or UNCLASSIFIED_TOPIC).strip() or UNCLASSIFIED_TOPIC
-            return topic in allowed
+            return _topic_of(point) in allowed
     return False
 
 
@@ -294,11 +304,13 @@ def count_new_tasks(path) -> int:
 
     复习题本身不计数——它就是用来打断新题连发的，出完重新开始数。
     """
-    for record in reversed(read_task_records(path)):
+    records = read_task_records(path)
+    count = 0
+    for record in reversed(records):
         if is_review_record(record):
-            return 0
-    # 没有复习题：整份记录里的新题都算
-    return sum(1 for record in read_task_records(path) if not is_review_record(record))
+            break
+        count += 1
+    return count
 
 
 def is_review_record(record) -> bool:
@@ -341,21 +353,19 @@ def pick_review_point(profile, *, stale_days: int = DEFAULT_STALE_DAYS, today=No
     **没有 last_touched 的老画像按超期算**——否则这个功能对老数据永远不生效。
     """
     moment = today or datetime.now().date()
-    candidates: list = []
+    threshold = max(0, int(stale_days))
+    candidates: list[tuple[int, str]] = []
     for point in profile.points:
         if point.level != "学过":
             continue
         gap = _days_since(getattr(point, "last_touched", ""), moment)
-        if gap is None or gap >= max(0, int(stale_days)):
-            candidates.append(point)
+        if gap is None or gap >= threshold:
+            # 没有时间戳的老画像按「很久没碰」排：越久没碰越优先
+            candidates.append((gap if gap is not None else 10 ** 6, point.name))
     if not candidates:
         return None
-    # 越久没碰越优先；并列时按画像里的顺序（稳定）
-    def rank(point):
-        gap = _days_since(getattr(point, "last_touched", ""), moment)
-        return (-(gap if gap is not None else 10 ** 6),)
-
-    return sorted(candidates, key=rank)[0].name
+    # max 取第一个最大值：并列时保持画像里的顺序（稳定）
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def mark_review(task: "GeneratedTask", point: str) -> "GeneratedTask":
@@ -390,14 +400,11 @@ def render_review_task(point: str) -> "GeneratedTask":
     )
 
 
-UNCLASSIFIED_TOPIC = "未分类"
-
-
 def selectable_topics(profile: KnowledgeProfile) -> list[str]:
     """画像里出现过的主题（用于看板多选）。「未分类」永远排最后。"""
     seen: list[str] = []
     for point in profile.points:
-        topic = (point.topic or UNCLASSIFIED_TOPIC).strip() or UNCLASSIFIED_TOPIC
+        topic = _topic_of(point)
         if topic not in seen:
             seen.append(topic)
     # 保序（画像里的出现顺序）——看板的复选框顺序要稳定、可预期；
@@ -444,12 +451,7 @@ def filter_profile_by_topics(profile: KnowledgeProfile, topics=None) -> Knowledg
     if not wanted:
         return profile
     allowed = set(wanted)
-    kept = [
-        point
-        for point in profile.points
-        if ((point.topic or UNCLASSIFIED_TOPIC).strip() or UNCLASSIFIED_TOPIC) in allowed
-    ]
-    return KnowledgeProfile(points=kept)
+    return KnowledgeProfile(points=[point for point in profile.points if _topic_of(point) in allowed])
 
 
 def next_unmet_point(syllabus: dict | None, profile: KnowledgeProfile) -> str | None:
@@ -508,36 +510,18 @@ def pick_book_and_point(
         found = _first_unmet_in_book(chosen, mastered)
         return (chosen, found) if found else None
 
-    # 没有任何书与画像有交集 → 退回第一本
-    best = None
-    best_hits = 0
-    for book in books:
-        points = {
-            str(point).strip()
-            for chapter in getattr(book, "chapters", []) or []
-            for point in getattr(chapter, "points", []) or []
-        }
-        hits = len(points & mastered)
-        if hits > best_hits:
-            best, best_hits = book, hits
-    if best is None:
+    # 每本书与画像的交集大小只算一次（选书与按相关度排序都用它）
+    hits = [len(_book_points(book) & mastered) for book in books]
+    if not any(hits):
+        # 没有任何书与画像有交集 → 退回第一本
         chosen = source[0]
         found = _first_unmet_in_book(chosen, mastered)
         return (chosen, found) if found else None
+    best_index = hits.index(max(hits))  # 平手取地图里靠前的那本
 
     # 选中的书若已没有"该学的新东西"，就按相关度依次看下一本（T-021 实测：
     # HTML 书的高置信度点全已掌握时，硬塞一个未映射的零碎条目没有意义）。
-    ranked = sorted(
-        range(len(books)),
-        key=lambda i: -len(
-            {
-                str(point).strip()
-                for chapter in getattr(books[i], "chapters", []) or []
-                for point in getattr(chapter, "points", []) or []
-            }
-            & mastered
-        ),
-    )
+    ranked = sorted(range(len(books)), key=lambda i: -hits[i])
     for candidate_index in ranked:
         found = _mapped_unmastered_in_book(
             books[candidate_index],
@@ -549,8 +533,7 @@ def pick_book_and_point(
             # 书与点来自**同一个** candidate_index —— 这就是修掉错位的关键
             return source[candidate_index], found
 
-    index = books.index(best)
-    chosen = source[index]
+    chosen = source[best_index]
     found = _first_unmet_in_book(chosen, mastered)
     return (chosen, found) if found else None
 
@@ -582,83 +565,6 @@ def next_unmet_point_for_books(
     """
     picked = pick_book_and_point(books, profile, raw_books=raw_books, topics=topics)
     return picked[1] if picked else None
-
-
-def _legacy_next_unmet_point_for_books(
-    books: list | None,
-    profile: KnowledgeProfile,
-    raw_books: list | None = None,
-    topics=None,
-) -> str | None:
-    if not books:
-        return None
-
-    # T-029：过滤在**点**这一级做——只把"落在选中主题里"的点放进书。
-    #
-    # 曾经写成"按书过滤"（整本书只要有一个点匹配就留下），结果是：
-    # 「网页书」里有一个画像还未知的点（弹性盒），整本书就被留下，
-    # 于是只选「样式与布局」时仍然会挑出「网页书」的「网格布局」。
-    # 正确语义是"在选中主题里找下一个该学的点"，所以必须逐点筛。
-    wanted = normalize_topics(topics)
-    if wanted:
-        allowed = set(wanted)
-        books = [_keep_points_in_topics(book, allowed, profile) for book in books]
-        books = [book for book in books if book is not None]
-        if raw_books:
-            raw_books = [_keep_points_in_topics(book, allowed, profile) for book in raw_books]
-            raw_books = [book for book in raw_books if book is not None]
-        if not books:
-            return None
-
-    mastered = {p.name for p in profile.points if p.level in MASTERED_LEVELS}
-    profile_names = mastered | {p.name for p in profile.points}
-    if not mastered:
-        chosen_raw = (raw_books or books)[0]
-        return _first_unmet_in_book(chosen_raw, mastered)
-
-    best = None
-    best_hits = 0
-    for book in books:
-        # 只把「其中至少一个点对齐到了已掌握概念」的书算作相关：
-        # 用交集个数（一个概念可能对应书里很多点），而不是去重后的概念个数。
-        points = {
-            str(point).strip()
-            for chapter in getattr(book, "chapters", []) or []
-            for point in getattr(chapter, "points", []) or []
-        }
-        hits = len(points & mastered)
-        if hits > best_hits:
-            best, best_hits = book, hits
-
-    # 选中书与原始书按下标一一对应（apply_alignment 保序）
-    index = books.index(best) if best is not None else 0
-    if best is None:
-        # 没有任何书与画像有交集：退回第一本
-        return _first_unmet_in_book((raw_books or books)[0], mastered)
-
-    # 选中的书若已没有"该学的新东西"，就按相关度依次看下一本（T-021 实测：
-    # HTML 书的高置信度点全已掌握时，硬塞一个未映射的零碎条目没有意义）。
-    ranked = sorted(
-        range(len(books)),
-        key=lambda i: -len(
-            {
-                str(point).strip()
-                for chapter in getattr(books[i], "chapters", []) or []
-                for point in getattr(chapter, "points", []) or []
-            }
-            & mastered
-        ),
-    )
-    for candidate_index in ranked:
-        found = _mapped_unmastered_in_book(
-            books[candidate_index],
-            (raw_books or books)[candidate_index],
-            mastered,
-            profile_names,
-        )
-        if found:
-            return found
-    return _first_unmet_in_book((raw_books or books)[index], mastered)
 
 
 def _mapped_unmastered_in_book(book, raw, mastered: set[str], profile_names: set[str]) -> str | None:
@@ -739,32 +645,17 @@ def _first_unmet_in_book(book, mastered: set[str]) -> str | None:
     return None
 
 
-_JSON_FENCE_RE = re.compile("```(?:json)?\\\\s*(.+?)```", re.DOTALL)
-
-
 def _extract_json(raw: str):
-    text = (raw or "").strip()
-    if not text:
-        raise PlannerError("LLM 返回了空内容")
-    fenced = _JSON_FENCE_RE.search(text)
-    if fenced:
-        text = fenced.group(1).strip()
     # 实测：真实模型常在 JSON 后继续写说明文字（"希望这个任务对你有帮助"）。
-    # 因此不能要求「整段都是 JSON」，而要用 raw_decode 从第一个 { / [ 起取出一个完整 JSON 值。
-    starts = [index for index in (text.find("{"), text.find("[")) if index >= 0]
-    if not starts:
-        raise PlannerError("LLM 输出里找不到 JSON，请重试")
-
-    decoder = json.JSONDecoder()
-    last_error: Exception | None = None
-    for start in sorted(starts):
-        try:
-            value, _ = decoder.raw_decode(text[start:])
-            return value
-        except ValueError as exc:
-            last_error = exc
-            continue
-    raise PlannerError(f"LLM 输出的 JSON 无法解析：{last_error}；请重试") from None
+    # extract_json 用 raw_decode 只取第一个完整 JSON 值，围栏、寒暄、尾巴都能容忍。
+    try:
+        return extract_json(raw)
+    except JSONExtractionError as exc:
+        if exc.reason == "empty":
+            raise PlannerError("LLM 返回了空内容") from None
+        if exc.reason == "missing":
+            raise PlannerError("LLM 输出里找不到 JSON，请重试") from None
+        raise PlannerError(f"LLM 输出的 JSON 无法解析：{exc.detail}；请重试") from None
 
 
 def parse_task(raw: str) -> GeneratedTask:
@@ -888,7 +779,7 @@ def generate_task(
                 f"画像里只有 {len(profile.points)} 个知识点，少于 {MIN_POINTS} 个，先多记几篇笔记再出题"
             )
         raise PlannerError(
-            f"画像里已掌握（学过/做过）的知识点只有 {len(mastered)} 个，少于 {MIN_POINTS} 个，"
+            f"画像里已掌握（{'/'.join(MASTERED_LEVELS)}）的知识点只有 {len(mastered)} 个，少于 {MIN_POINTS} 个，"
             "不足以出题：请先把「存疑」的知识点补学后确认状态，或再记几篇有解释/示例的笔记"
         )
 
@@ -987,13 +878,7 @@ def read_given_idents(tasks_path) -> set[str]:
 
     留档里出处行形如：`**题目出处**：哈佛 CS50（A-01 个人名片页） ｜ 来自题库`。
     """
-    target = Path(tasks_path)
-    if not target.is_file():
-        return set()
-    try:
-        text = target.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return set()
+    text = read_text_or_none(tasks_path) or ""
     return {match.group("ident") for match in _GIVEN_IDENT_RE.finditer(text)}
 
 
@@ -1002,23 +887,16 @@ def read_latest_task_points(tasks_path) -> list[str]:
 
     T-024 M-01：看板「回写」按钮的下拉候选就来自这里——按最近任务回写最顺手。
     """
-    target = Path(tasks_path)
-    if not target.is_file():
-        return []
-    try:
-        text = target.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
+    text = read_text_or_none(tasks_path) or ""
     blocks = re.split(r"^##\s+\d{4}-\d{2}-\d{2}", text, flags=re.M)
     if len(blocks) < 2:
         return []
     latest = blocks[-1]
     points: list[str] = []
     for label in ("用到的知识点", "新知识点"):
-        match = re.search(rf"^\*\*{label}\*\*[：:]\s*(?P<value>.+?)\s*$", latest, re.M)
-        if not match:
+        value = _field(latest, label)
+        if not value:
             continue
-        value = match.group("value")
         value = re.sub(r"（[^（）]*）", "", value)          # 去掉「（本次唯一的新点）」
         for item in re.split(r"[、,，]", value):
             name = item.strip()
@@ -1029,13 +907,7 @@ def read_latest_task_points(tasks_path) -> list[str]:
 
 def read_recent_goals(tasks_path, limit: int = 5) -> list[str]:
     """从 tasks.md 里读出最近几个任务目标，喂给出题 prompt 避免重复。"""
-    target = Path(tasks_path)
-    if not target.is_file():
-        return []
-    try:
-        text = target.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
+    text = read_text_or_none(tasks_path) or ""
     goals = re.findall(r"^\*\*目标\*\*[：:]\s*(?P<goal>.+?)\s*$", text, re.M)
     return [goal.strip() for goal in goals if goal.strip()][-max(1, limit):]
 
@@ -1065,14 +937,7 @@ def read_task_records(path) -> list[TaskRecord]:
 
     只认「## <时间戳>」分隔的块；解析不出的字段留空，不抛异常（页面要能打开）。
     """
-    target = Path(path)
-    if not target.is_file():
-        return []
-    try:
-        text = target.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-
+    text = read_text_or_none(path) or ""
     marks = list(_RECORD_SPLIT_RE.finditer(text))
     records: list[TaskRecord] = []
     for index, mark in enumerate(marks):
@@ -1083,7 +948,8 @@ def read_task_records(path) -> list[TaskRecord]:
 
 
 def _field(block: str, label: str) -> str:
-    match = re.search(rf"^\*\*{label}\*\*[：:]\s*(?P<value>.+?)\s*$", block, re.M)
+    """取任务块里「**标签**：值」那一行的值（没有就空串）。任务记录与点评留档共用。"""
+    match = re.search(rf"^\*\*{re.escape(label)}\*\*[：:]\s*(?P<value>.+?)\s*$", block, re.M)
     return match.group("value").strip() if match else ""
 
 
@@ -1134,11 +1000,6 @@ class ReviewRecord:
 REVIEW_HEADING = "### 作业点评"
 
 
-def _field_in_block(block: str, label: str) -> str:
-    match = re.search(rf"^\*\*{re.escape(label)}\*\*[：:]\s*(?P<value>.+?)\s*$", block, re.M)
-    return match.group("value").strip() if match else ""
-
-
 # 提交的代码写在 details 块里的一对围栏之间（append_review 的格式）
 _CODE_FENCE_RE = re.compile(
     r"<details><summary>本次提交的代码</summary>\s*\n```[^\n]*\n(?P<code>.*?)\n```",
@@ -1151,9 +1012,9 @@ def parse_reviews(block: str) -> list[ReviewRecord]:
     records: list[ReviewRecord] = []
     parts = block.split(REVIEW_HEADING)
     for part in parts[1:]:
-        submitted = _field_in_block(part, "提交时间")
-        feedback = _field_in_block(part, "评价")
-        suggestion = _field_in_block(part, "建议")
+        submitted = _field(part, "提交时间")
+        feedback = _field(part, "评价")
+        suggestion = _field(part, "建议")
         if not (submitted or feedback):
             continue
         records.append(
@@ -1166,6 +1027,33 @@ def parse_reviews(block: str) -> list[ReviewRecord]:
             )
         )
     return records
+
+
+def _locate_task_block(target: Path, stamp: str) -> tuple[str, int, int]:
+    """读 tasks.md 并定位时间戳为 stamp 的任务块，返回 (全文, 块起点, 块终点)。
+
+    append_review / delete_task_record 共用：**只动目标块**的前提是先准确找到它。
+    """
+    if not target.is_file():
+        raise PlannerError(f"找不到任务记录：{target}")
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise PlannerError(f"读取任务记录失败：{target}（{type(exc).__name__}）") from None
+
+    marks = list(_RECORD_SPLIT_RE.finditer(text))
+    for position, mark in enumerate(marks):
+        if mark.group("when").strip() == stamp:
+            end = marks[position + 1].start() if position + 1 < len(marks) else len(text)
+            return text, mark.start(), end
+    raise PlannerError(f"任务记录里没有时间戳为「{stamp}」的块")
+
+
+def _write_task_file(target: Path, text: str) -> Path:
+    try:
+        return write_text_atomic(target, text)
+    except OSError as exc:
+        raise PlannerError(f"写入任务记录失败：{target}（{type(exc).__name__}）") from None
 
 
 def append_review(
@@ -1183,31 +1071,16 @@ def append_review(
     代码上限由本函数把关（T-028）：超过 8000 字符就截断并在留档里注明，
     调用方不用自己裁——省得某条调用路径忘了裁而把整份代码塞进 tasks.md。
     """
-    from .review import prepare_code
+    from .review import MAX_CODE_CHARS, prepare_code
 
-    prepared_code, was_truncated = prepare_code(code)
-    code = prepared_code
+    code, was_truncated = prepare_code(code)
     truncated = bool(truncated) or was_truncated
 
     target = Path(path)
     stamp = str(when or "").strip()
     if not stamp:
         raise PlannerError("提交作业需要给出任务时间戳")
-    if not target.is_file():
-        raise PlannerError(f"找不到任务记录：{target}")
-
-    try:
-        text = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        raise PlannerError(f"读取任务记录失败：{target}（{type(exc).__name__}）") from None
-
-    marks = list(_RECORD_SPLIT_RE.finditer(text))
-    hit = next((m for m in marks if m.group("when").strip() == stamp), None)
-    if hit is None:
-        raise PlannerError(f"任务记录里没有时间戳为「{stamp}」的块")
-
-    position = marks.index(hit)
-    end = marks[position + 1].start() if position + 1 < len(marks) else len(text)
+    text, _start, end = _locate_task_block(target, stamp)
     moment = submitted_at or datetime.now().strftime("%Y-%m-%d %H:%M")
 
     lines = [
@@ -1220,23 +1093,12 @@ def append_review(
     if suggestion.strip():
         lines.append(f"**建议**：{suggestion.strip()}")
     if truncated:
-        lines.append("**说明**：代码超过 8000 字符，已截断后点评（已截断）")
+        lines.append(f"**说明**：代码超过 {MAX_CODE_CHARS} 字符，已截断后点评（已截断）")
     if code:
         lines.extend(["", "<details><summary>本次提交的代码</summary>", "", "```", code.rstrip(), "```", "", "</details>"])
     addition = "\n".join(lines) + "\n"
 
-    new_text = text[:end].rstrip() + "\n" + addition + text[end:]
-    tmp = target.with_name(target.name + ".tmp")
-    try:
-        tmp.write_text(new_text, encoding="utf-8")
-        tmp.replace(target)
-    except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise PlannerError(f"写入任务记录失败：{target}（{type(exc).__name__}）") from None
-    return target
+    return _write_task_file(target, text[:end].rstrip() + "\n" + addition + text[end:])
 
 
 def delete_task_record(path, when: str) -> Path:
@@ -1245,35 +1107,8 @@ def delete_task_record(path, when: str) -> Path:
     stamp = str(when or "").strip()
     if not stamp:
         raise PlannerError("删除任务需要给出时间戳")
-    if not target.is_file():
-        raise PlannerError(f"找不到任务记录：{target}")
-
-    try:
-        text = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        raise PlannerError(f"读取任务记录失败：{target}（{type(exc).__name__}）") from None
-
-    marks = list(_RECORD_SPLIT_RE.finditer(text))
-    hit = next((m for m in marks if m.group("when").strip() == stamp), None)
-    if hit is None:
-        raise PlannerError(f"任务记录里没有时间戳为「{stamp}」的块")
-
-    position = marks.index(hit)
-    start = hit.start()
-    end = marks[position + 1].start() if position + 1 < len(marks) else len(text)
-    new_text = (text[:start] + text[end:]).rstrip() + "\n"
-
-    tmp = target.with_name(target.name + ".tmp")
-    try:
-        tmp.write_text(new_text, encoding="utf-8")
-        tmp.replace(target)
-    except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise PlannerError(f"写入任务记录失败：{target}（{type(exc).__name__}）") from None
-    return target
+    text, start, end = _locate_task_block(target, stamp)
+    return _write_task_file(target, (text[:start] + text[end:]).rstrip() + "\n")
 
 
 def render_task(task: GeneratedTask) -> str:

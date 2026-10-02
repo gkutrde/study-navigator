@@ -347,6 +347,15 @@ def test_history_overflow_keeps_handoff_in_real_prompt(tmp_path, monkeypatch):
     test_build_prompt_keeps_handoff_when_history_huge —— 那条是直调 build_prompt，
     没有 summarizer，所以那条的「已裁剪」断言仍然成立）。
     """
+    from src import cli
+
+    class SummaryCompleter:
+        """摘要用的 LLM 桩：本用例要走「有摘要器」的路径，不能依赖真机有没有登录态（T-050）。"""
+
+        def complete(self, messages):
+            return "前几轮讨论的要点：学生在问名片页的结构"
+
+    monkeypatch.setattr(cli, "make_llm_completer", lambda **kwargs: SummaryCompleter())
     directory = make_directory(tmp_path)
     seen = _stub_llm(monkeypatch, ["很长" * 4000])
     board = make_board(tmp_path, directory)

@@ -21,15 +21,15 @@ import hashlib
 from pathlib import Path
 import re
 
+from .fileio import read_text_or_none, write_text_atomic
 from .llm import LLMError
-from .profile import KnowledgeProfile
-from .syllabus import BookMap, Chapter, load_syllabus
+from .syllabus import BookMap
 
 DEFAULT_BOOKS_DIR = Path("books")
 DEFAULT_SRC_DIR = Path("books") / "_src"
 # 单次送 LLM 的参考文本上限（任务卡硬性要求）
 MAX_REFERENCE_CHARS = 3000
-TRUNCATED_NOTE = "\n\n（参考文本过长，已截断到前 3000 字符）"
+TRUNCATED_NOTE = f"\n\n（参考文本过长，已截断到前 {MAX_REFERENCE_CHARS} 字符）"
 
 _PREFIX_ROW_RE = re.compile(r"^\|\s*`(?P<prefix>[a-z0-9-]+)`\s*\|\s*(?P<book>[^|]+?)\s*\|", re.M)
 # 真实蒸馏稿里区间有四种写法（实测）：
@@ -38,6 +38,12 @@ _PREFIX_ROW_RE = re.compile(r"^\|\s*`(?P<prefix>[a-z0-9-]+)`\s*\|\s*(?P<book>[^|
 # 行号要求 ≥3 位，避免把「（第 1–11 章）」「（带标签关系句，47 条）」当成行号区间。
 # 「第 12 章」→ 12；用于章名中英不一致时的兜底匹配
 _CHAPTER_NO_RE = re.compile(r"第\s*(\d{1,3})\s*章")
+# 「8.1 结构：…」这类小节名：按章号兜底匹配时要排除它们
+_SUBSECTION_RE = re.compile(r"^\d+\.\d+")
+_BOOK_FIELD_RE = re.compile(r"^book:\s*(.+)$", re.M)
+_SOURCE_FIELD_RE = re.compile(r"^source:\s*([A-Za-z0-9-]+)\s*$", re.M)
+# frontmatter 只看文件开头这么多字符
+_HEAD_CHARS = 600
 
 
 def _chapter_number(text: str) -> str | None:
@@ -99,13 +105,7 @@ class ExplainResult:
 
 def load_source_map(readme_path: Path | str) -> dict[str, str]:
     """解析 `books/_src/README.md` 的「前缀 ↔ 书名」对照表。"""
-    target = Path(readme_path)
-    if not target.is_file():
-        return {}
-    try:
-        text = target.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return {}
+    text = read_text_or_none(readme_path) or ""
     mapping: dict[str, str] = {}
     for match in _PREFIX_ROW_RE.finditer(text):
         mapping[match.group("prefix")] = match.group("book").strip()
@@ -157,7 +157,7 @@ def _chapter_range(distillate: str, chapter: str) -> tuple[int, int] | None:
             return span
         if fallback is None and wanted_no and _chapter_number(raw_name) == wanted_no:
             # 排除「8.1 结构：…（第 1 章，…）」这类小节：名字以数字点号开头
-            if not re.match(r"^\d+\.\d+", raw_name):
+            if not _SUBSECTION_RE.match(raw_name):
                 fallback = span
     return fallback
 
@@ -173,15 +173,15 @@ def _find_distillate(
     """
     if not books_dir.is_dir():
         return None
-    candidates = sorted(books_dir.glob("蒸馏-*.md"))
     files: list[tuple[Path, str, str]] = []
-    for path in candidates:
-        try:
-            head = path.read_text(encoding="utf-8", errors="replace")[:600]
-        except OSError:
+    for path in sorted(books_dir.glob("蒸馏-*.md")):
+        text = read_text_or_none(path)
+        if text is None:
             continue
-        match = re.search(r"^book:\s*(.+)$", head, re.M)
-        files.append((path, match.group(1).strip() if match else path.stem, read_source_prefix(path) or ""))
+        # 每个蒸馏稿只读一次：书名与 source 前缀都从同一段开头里取（以前同一个文件读两遍）
+        head = text[:_HEAD_CHARS]
+        match = _BOOK_FIELD_RE.search(head)
+        files.append((path, match.group(1).strip() if match else path.stem, _source_prefix_in(head) or ""))
 
     if source_prefix:
         for path, _title, prefix in files:
@@ -244,12 +244,8 @@ def cache_path_for(cache_dir: Path | str, point: str) -> Path:
 
 def read_cached_explanation(cache_dir: Path | str, point: str) -> str | None:
     """读缓存；没有或读不出返回 None。"""
-    path = cache_path_for(cache_dir, point)
-    if not path.is_file():
-        return None
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
+    raw = read_text_or_none(cache_path_for(cache_dir, point))
+    if raw is None:
         return None
     # 缓存文件格式：--- ... --- 的 frontmatter + 正文
     text = raw.lstrip("\ufeff")
@@ -274,18 +270,10 @@ def save_explanation(cache_dir: Path | str, point: str, result: "ExplainResult")
         "---\n\n"
         f"{result.text.strip()}\n"
     )
-    tmp = path.with_name(path.name + ".tmp")
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(content, encoding="utf-8")
-        tmp.replace(path)
+        return write_text_atomic(path, content)
     except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return None
-    return path
+        return None  # 缓存写不进去只是下次再调一次 LLM，不该让这次讲解失败
 
 
 def _map_profile_name(name: str, profile, alignment_path) -> str | None:
@@ -353,15 +341,13 @@ def find_explain_source(
     #    前缀先按「书名覆盖率」猜；据此找到声明了该前缀的蒸馏稿（或退回按书名找）
     guessed = _match_prefix(locator.book, src_path)
     distillate = _find_distillate(books_path, locator.book, source_prefix=guessed)
-    if distillate is not None:
-        try:
-            text = distillate.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            text = ""
-        span = _chapter_range(text, locator.chapter) if text else None
+    # 蒸馏稿全文只读一次：取行号区间、读 source 前缀、兜底取章节正文都用它
+    text = (read_text_or_none(distillate) or "") if distillate is not None else ""
+    if text:
+        span = _chapter_range(text, locator.chapter)
         if span:
             # 显式声明的 source 前缀优先；没有才用书名猜出来的
-            prefix = read_source_prefix(distillate) or guessed
+            prefix = _source_prefix_in(text[:_HEAD_CHARS]) or guessed
             if prefix:
                 txt = src_path / f"{prefix}.txt"
                 if txt.is_file():
@@ -378,8 +364,8 @@ def find_explain_source(
                         )
 
     # 2) 兜底：蒸馏稿里那一章的内容
-    if distillate is not None:
-        section = _distillate_section(distillate, locator.chapter)
+    if distillate is not None and text:
+        section = _section_of(text, locator.chapter)
         if section.strip():
             return ExplainSource(
                 point=locator.point,
@@ -411,14 +397,12 @@ def read_source_prefix(distillate_path: Path | str) -> str | None:
 
     显式声明比按书名猜可靠得多——实测译名差异会让覆盖率从 0.11 到 0.78 都有。
     """
-    target = Path(distillate_path)
-    if not target.is_file():
-        return None
-    try:
-        head = target.read_text(encoding="utf-8", errors="replace")[:600]
-    except OSError:
-        return None
-    match = re.search(r"^source:\s*([A-Za-z0-9-]+)\s*$", head, re.M)
+    text = read_text_or_none(distillate_path)
+    return _source_prefix_in(text[:_HEAD_CHARS]) if text else None
+
+
+def _source_prefix_in(head: str) -> str | None:
+    match = _SOURCE_FIELD_RE.search(head)
     return match.group(1) if match else None
 
 
@@ -458,10 +442,11 @@ def _distillate_section(distillate_path: Path, chapter: str) -> str:
 
     章名匹配与 _chapter_range 一致：先比名字，对不上再按章号兜底。
     """
-    try:
-        text = distillate_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
+    return _section_of(read_text_or_none(distillate_path) or "", chapter)
+
+
+def _section_of(text: str, chapter: str) -> str:
+    """在已读入的蒸馏稿全文里取某一章的正文（_distillate_section 的纯文本版）。"""
     if not text:
         return ""
 
@@ -481,7 +466,7 @@ def _distillate_section(distillate_path: Path, chapter: str) -> str:
             chosen is None
             and wanted_no
             and _chapter_number(raw_name) == wanted_no
-            and not re.match(r"^\d+\.\d+", raw_name)
+            and not _SUBSECTION_RE.match(raw_name)
         ):
             chosen = index
     if chosen is None:
@@ -497,6 +482,7 @@ def _distillate_section(distillate_path: Path, chapter: str) -> str:
             end = later
             break
     return "\n".join(lines[chosen:end]).strip()
+
 
 SYSTEM_PROMPT = """你是耐心的高校助教，负责给一名大一计算机方向的学生讲解**一个**知识点。
 
@@ -537,18 +523,21 @@ def explain_point(
 
     T-024 M-03：`cache_dir` 给了就启用缓存——同名知识点第二次**零 LLM 调用**；
     `refresh=True` 强制重新生成并覆盖缓存。
+
+    缓存按**地图里的点名**（source.point）存取：用户可能用画像名 / 缩略名提问，
+    以前读缓存用用户输入、写缓存用地图名，两者不同时缓存永远命中不了。
     """
+    source = find_explain_source(
+        point,
+        books,
+        books_dir=books_dir,
+        src_dir=src_dir,
+        profile=profile,
+        alignment_path=alignment_path,
+    )
     if cache_dir and not refresh:
-        cached = read_cached_explanation(cache_dir, point)
+        cached = read_cached_explanation(cache_dir, source.point)
         if cached:
-            source = find_explain_source(
-                point,
-                books,
-                books_dir=books_dir,
-                src_dir=src_dir,
-                profile=profile,
-                alignment_path=alignment_path,
-            )
             return ExplainResult(
                 text=cached,
                 book=source.book,
@@ -558,14 +547,6 @@ def explain_point(
                 from_cache=True,
             )
 
-    source = find_explain_source(
-        point,
-        books,
-        books_dir=books_dir,
-        src_dir=src_dir,
-        profile=profile,
-        alignment_path=alignment_path,
-    )
     try:
         text = completer.complete(build_explain_messages(source.point, source))
     except LLMError as exc:

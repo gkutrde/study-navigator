@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 import re
 from typing import Any
 
+from .llm import LLMError
+
 
 class ReviewError(Exception):
     """点评失败（LLM 不可用、返回为空等）。"""
@@ -36,7 +38,7 @@ class ReviewResult:
         if self.suggestion:
             parts.append(f"【建议】{self.suggestion}")
         if self.truncated:
-            parts.append("（代码超过 8000 字符，已截断后点评）")
+            parts.append(f"（代码超过 {MAX_CODE_CHARS} 字符，已截断后点评）")
         return "\n\n".join(parts)
 
 
@@ -64,7 +66,10 @@ def build_review_messages(
     """构造点评 prompt。**验收方式是点评的标尺**，必须带上。"""
     limit_note = ""
     if truncated:
-        limit_note = "\n（注意：代码超过 8000 字符已被截断，只看到前 8000 字符，请在评价里说明这一点。）"
+        limit_note = (
+            f"\n（注意：代码超过 {MAX_CODE_CHARS} 字符已被截断，只看到前 {MAX_CODE_CHARS} 字符，"
+            "请在评价里说明这一点。）"
+        )
     system = (
         "你是一位严格但友善的编程助教，负责批改学生的动手作业。\n"
         "请**严格对照验收方式**判断是否达标，然后给出：\n"
@@ -150,8 +155,10 @@ def review_code(
     )
     try:
         raw = completer.complete(messages)
-    except Exception as exc:
+    except LLMError as exc:
         raise ReviewError(f"点评失败：{exc}") from None
+    except Exception as exc:  # 与其它模块同一口径：未知异常只报类型名，避免把请求体/Key 带出来
+        raise ReviewError(f"点评失败：{type(exc).__name__}") from None
     if with_problems:
         feedback, suggestion, problems = parse_review(raw, with_problems=True)
     else:
