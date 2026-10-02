@@ -311,6 +311,17 @@ def _resolve_point_index(points: list[KnowledgePoint], name: str) -> int:
     raise PointNotFoundError(f"画像里没有知识点「{wanted}」；可选：{everything}")
 
 
+def resolve_point_name(profile: KnowledgeProfile, name: str) -> str | None:
+    """把用户给的名字（可能是缩略名，如「列表」）解析成画像里的完整点名（「列表（ul/ol/li）」）。
+
+    解析规则与 done / 改状态完全一致（精确优先、归一化唯一）；不存在或有歧义时返回 None。
+    """
+    try:
+        return profile.points[_resolve_point_index(list(profile.points), name)].name
+    except ProfileError:
+        return None
+
+
 def _with_recital(evidence: str, spoken: str) -> str:
     """有费曼复述时把「复述：…」并进证据（T-019）。"""
     return _merge_evidence(evidence, f"复述：{spoken}") if spoken else evidence

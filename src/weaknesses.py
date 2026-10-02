@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import re
 import time
+
+from .fileio import read_text_or_none, write_text_atomic
 
 
 class WeaknessError(Exception):
@@ -20,6 +21,11 @@ MAX_PER_SUBMISSION = 3
 MAX_ITEM_CHARS = 40
 FILENAME = "weaknesses.md"
 HEADER = "# 薄弱点清单"
+
+_ITEM_RE = re.compile(r"^\s*-\s*(?P<body>.+?)\s*$")
+# 行尾的时间戳段：「 — 首次：A，最近：B」，两段都可缺省、顺序不限（render_weaknesses 写的就是这个格式）
+_STAMPS_RE = re.compile(r"\s*[—-]\s*(?P<stamps>(?:(?:首次|最近)：\d{4}-\d{2}-\d{2}[，,\s]*)+)$")
+_STAMP_RE = re.compile(r"(?P<kind>首次|最近)：(?P<day>\d{4}-\d{2}-\d{2})")
 
 
 @dataclass(frozen=True)
@@ -48,31 +54,32 @@ def _clean(items) -> list:
 
 
 def load_weaknesses(profile_dir: Path | str) -> list:
-    """读清单；文件不存在或读不了就返回空列表（绝不因为错题本坏了挡住出题）。"""
-    target = weaknesses_path(profile_dir)
-    if not target.is_file():
-        return []
-    try:
-        text = target.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    """读清单；文件不存在或读不了就返回空列表（绝不因为错题本坏了挡住出题）。
+
+    时间戳段按整段解析：以前先按「首次」切掉行尾、再找「最近」，而写出的格式是
+    「首次：A，最近：B」——「最近」跟着「首次」一起被切掉，last_seen 每读一次就丢一次，
+    下次保存时也就从文件里消失了（周报的「窗口内复现」因此只能看首次时间）。
+    """
+    text = read_text_or_none(weaknesses_path(profile_dir))
+    if text is None:
         return []
 
     items: list = []
     seen: set = set()
     for line in text.splitlines():
-        match = re.match(r"^\s*-\s*(?P<body>.+?)\s*$", line)
+        match = _ITEM_RE.match(line)
         if not match:
             continue
         body = match.group("body").strip()
         first = last = ""
-        stamp = re.search(r"[—-]\s*首次：(?P<first>\d{4}-\d{2}-\d{2})", body)
-        if stamp:
-            first = stamp.group("first")
-            body = body[: stamp.start()].rstrip()
-        stamp2 = re.search(r"[—-]\s*最近：(?P<last>\d{4}-\d{2}-\d{2})", body)
-        if stamp2:
-            last = stamp2.group("last")
-            body = body[: stamp2.start()].rstrip()
+        stamps = _STAMPS_RE.search(body)
+        if stamps:
+            for stamp in _STAMP_RE.finditer(stamps.group("stamps")):
+                if stamp.group("kind") == "首次":
+                    first = stamp.group("day")
+                else:
+                    last = stamp.group("day")
+            body = body[: stamps.start()].rstrip()
         body = re.sub(r"\s+", " ", body).strip()
         if not body or body in seen:
             continue
@@ -96,19 +103,10 @@ def render_weaknesses(items) -> str:
 
 
 def save_weaknesses(profile_dir: Path | str, items) -> Path:
-    target = weaknesses_path(profile_dir)
-    tmp = target.with_name(target.name + ".tmp")
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(render_weaknesses(items), encoding="utf-8")
-        os.replace(tmp, target)
+        return write_text_atomic(weaknesses_path(profile_dir), render_weaknesses(items))
     except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise WeaknessError("写薄弱点清单失败：" + type(exc).__name__) from None
-    return target
 
 
 def merge_weaknesses(profile_dir: Path | str, problems, *, when: str = "") -> list:
@@ -144,18 +142,9 @@ def remove_weaknesses(profile_dir: Path | str, targets) -> list:
         return []
     existing = load_weaknesses(profile_dir)
     removed = [item.text for item in existing if item.text in wanted]
-    kept = [item for item in existing if item.text not in wanted]
     if removed:
-        if kept:
-            save_weaknesses(profile_dir, kept)
-        else:
-            target = weaknesses_path(profile_dir)
-            tmp = target.with_name(target.name + ".tmp")
-            try:
-                tmp.write_text(render_weaknesses([]), encoding="utf-8")
-                os.replace(tmp, target)
-            except OSError as exc:
-                raise WeaknessError("写薄弱点清单失败：" + type(exc).__name__) from None
+        # 全删光也照常写（写出只有标题的空清单），与普通保存走同一条原子写路径
+        save_weaknesses(profile_dir, [item for item in existing if item.text not in wanted])
     return removed
 
 

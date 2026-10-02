@@ -9,20 +9,19 @@ prompt 每轮都重新拼：handoff 全文 + 历史 + 新消息。
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import re
 import time
 
+# 与 T-032 终端接力用同一个上限与同一套 prompt 头尾（以前两边各写一份，口径会漂移）
+from .chat import CONTEXT_HEAD, MAX_PROMPT_CHARS, question_tail
+from .fileio import write_text_atomic
 from .handoff import handoff_dir, task_file_id
 
 
 class ChatSessionError(Exception):
     """会话层失败（时间戳非法、角色非法、消息为空等）。"""
 
-
-# 与 T-032 保持同一个上限，避免两处口径漂移
-MAX_PROMPT_CHARS = 30000
 # 留给历史的下限：再挤也要保证最近几轮进得去
 MIN_HISTORY_BUDGET = 2000
 
@@ -115,32 +114,35 @@ def render_archive(when: str, turns) -> str:
 def save_archive(profile_dir: Path | str, when: str, turns) -> Path:
     """原子写留档（tmp + replace），失败抛 ChatSessionError。"""
     target = archive_path(profile_dir, when)
-    tmp = target.with_name(target.name + ".tmp")
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # T-043：追加轮次时要把**已有摘要块**带上，否则摘要会被这次重写冲掉
-        existing = None
-        if target.is_file():
-            try:
-                existing = load_summary(profile_dir, when)
-            except Exception:
-                existing = None
-        body = render_archive(when, turns)
-        if existing is not None:
-            block = "**" + SUMMARY_LABEL + "**" + chr(10) + chr(10) + existing.text
-            if existing.upto:
-                block += chr(10) + chr(10) + "（覆盖到第 " + str(existing.upto) + " 轮）"
-            first = body.find("## ")
-            body = (body[:first] + block + chr(10) + chr(10) + body[first:]) if first > 0 else (body + chr(10) + block)
-        tmp.write_text(body, encoding="utf-8")
-        os.replace(tmp, target)
-    except OSError as exc:
+    # T-043：追加轮次时要把**已有摘要块**带上，否则摘要会被这次重写冲掉
+    existing = None
+    if target.is_file():
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+            existing = load_summary(profile_dir, when)
+        except Exception:
+            existing = None
+    return _write_archive(target, _compose_archive(when, turns, existing))
+
+
+def _compose_archive(when: str, turns, summary: "HistorySummary | None") -> str:
+    """留档全文：轮次照常渲染；有摘要时把摘要块插在第一个轮次标题之前。"""
+    body = render_archive(when, turns)
+    if summary is None:
+        return body
+    block = f"**{SUMMARY_LABEL}**\n\n{summary.text}"
+    if summary.upto:
+        block += f"\n\n（覆盖到第 {summary.upto} 轮）"
+    first = body.find("## ")
+    if first > 0:
+        return body[:first] + block + "\n\n" + body[first:]
+    return body + "\n" + block
+
+
+def _write_archive(target: Path, text: str) -> Path:
+    try:
+        return write_text_atomic(target, text)
+    except OSError as exc:
         raise ChatSessionError("写对话留档失败：" + type(exc).__name__) from None
-    return target
 
 
 _HEADING_RE = re.compile(r"^##\s+(?P<who>.+?)(?:（(?P<at>[^）]*)）)?\s*$", re.M)
@@ -231,8 +233,7 @@ def save_summary(profile_dir: Path | str, when: str, text: str, upto: int) -> Hi
     """把摘要写进留档（独立块，人可读）。"""
     summary = HistorySummary(text=str(text or "").strip()[: SUMMARY_BUDGET * 4], upto=int(upto or 0))
     turns = load_turns(profile_dir, when)
-    _write_archive_with_summary(profile_dir, when, turns, summary)
-    _SUMMARY_MEMO[(str(profile_dir), str(when))] = summary
+    _write_archive(archive_path(profile_dir, when), _compose_archive(when, turns, summary))
     return summary
 
 
@@ -255,29 +256,6 @@ def load_summary(profile_dir: Path | str, when: str) -> HistorySummary | None:
     upto_match = _SUMMARY_META_RE.search(block)
     body = _SUMMARY_META_RE.sub("", block).strip()
     return HistorySummary(text=_strip_guard(body), upto=int(upto_match.group("upto")) if upto_match else 0)
-
-
-def _write_archive_with_summary(profile_dir: Path | str, when: str, turns, summary) -> None:
-    """写留档：摘要块放在最前面（在轮次之前），轮次照旧。"""
-    target = archive_path(profile_dir, when)
-    tmp = target.with_name(target.name + ".tmp")
-    body = render_archive(when, turns)
-    block = "**" + SUMMARY_LABEL + "**" + chr(10) + chr(10) + summary.text
-    if summary.upto:
-        block += chr(10) + chr(10) + "（覆盖到第 " + str(summary.upto) + " 轮）"
-    # 插在第一个轮次标题之前
-    first = body.find("## ")
-    merged = (body[:first] + block + chr(10) + chr(10) + body[first:]) if first > 0 else (body + chr(10) + block)
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(merged, encoding="utf-8")
-        os.replace(tmp, target)
-    except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise ChatSessionError("写对话留档失败：" + type(exc).__name__) from None
 
 
 def _render_history(turns) -> str:
@@ -324,14 +302,14 @@ def build_prompt(
     if not ask:
         raise ChatSessionError("消息不能为空")
 
-    head = "下面是这道练习的接力上下文，请据此回答我的问题：" + chr(10) + chr(10)
+    head = CONTEXT_HEAD
     body = str(context or '').strip()
-    tail = chr(10) + chr(10) + "【我的问题】" + ask + chr(10)
+    tail = question_tail(ask)
 
     if not turns:
         return head + body + tail
 
-    plain = chr(10) + chr(10) + "【之前的对话】" + chr(10) + _render_history(turns) + chr(10)
+    plain = "\n\n【之前的对话】\n" + _render_history(turns) + "\n"
     if len(head) + len(body) + len(tail) + len(plain) <= MAX_PROMPT_CHARS:
         return head + body + plain + tail
 
@@ -342,21 +320,21 @@ def build_prompt(
     old_turns, kept = _split_for_summary(turns, room)
 
     if summarizer is None or not old_turns:
-        note = chr(10) + "（历史过长，已裁剪 " + str(len(old_turns)) + " 轮最旧的对话；接力上下文未裁剪）"
-        history = chr(10) + chr(10) + "【之前的对话】" + note + chr(10) + _render_history(kept) + chr(10)
+        note = f"\n（历史过长，已裁剪 {len(old_turns)} 轮最旧的对话；接力上下文未裁剪）"
+        history = "\n\n【之前的对话】" + note + "\n" + _render_history(kept) + "\n"
         return head + body + history + tail
 
     summary = _get_or_make_summary(summarizer, old_turns, profile_dir, when)
-    note = chr(10) + "（更早的 " + str(len(old_turns)) + " 轮已压缩成摘要；接力上下文未裁剪）"
+    note = f"\n（更早的 {len(old_turns)} 轮已压缩成摘要；接力上下文未裁剪）"
     history = (
-        chr(10) + chr(10) + "【之前的对话】"
-        + chr(10) + chr(10) + "【较早对话摘要】" + chr(10)
+        "\n\n【之前的对话】"
+        + f"\n\n【{SUMMARY_LABEL}】\n"
         + str(summary.text).strip()[:SUMMARY_BUDGET]
-        + chr(10)
+        + "\n"
         + note
-        + chr(10)
+        + "\n"
         + _render_history(kept)
-        + chr(10)
+        + "\n"
     )
     return head + body + history + tail
 
@@ -387,15 +365,11 @@ def _get_or_make_summary(summarizer, old_turns, profile_dir, when) -> HistorySum
 
 
 SUMMARY_SYSTEM_PROMPT = (
-    "你在帮一段长对话做压缩。把下面这段较早的对话压成"
-    + chr(10)
-    + "不超过 " + str(SUMMARY_BUDGET) + " 字的摘要，要求："
-    + chr(10)
-    + "1. 保留所有**结论、决定、约定、具体数值/命名**（后面还要引用）；"
-    + chr(10)
-    + "2. 丢掉寒暄、重复、已经推翻的中间过程；"
-    + chr(10)
-    + "3. 直接输出摘要正文，不要写「总结如下」之类的前言。"
+    "你在帮一段长对话做压缩。把下面这段较早的对话压成\n"
+    f"不超过 {SUMMARY_BUDGET} 字的摘要，要求：\n"
+    "1. 保留所有**结论、决定、约定、具体数值/命名**（后面还要引用）；\n"
+    "2. 丢掉寒暄、重复、已经推翻的中间过程；\n"
+    "3. 直接输出摘要正文，不要写「总结如下」之类的前言。"
 )
 
 
