@@ -10,6 +10,7 @@ const src = new URL('../src/server/learning.ts', import.meta.url).href
 const mod = await import(src)
 const { handleLearning, resolveProjectRoot, buildCliArgs, ROUTE } = mod
 
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 // 本文件在 plugin/tests/ 下：再往上两级才是仓库根（plugin 的上一级）
@@ -20,11 +21,16 @@ function check(name, ok, detail) {
   console.log((ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' :: ' + detail : ''))
 }
 
+// 按真实路径比较，不按目录名：仓库克隆成什么名字都要能过（原先写死了 /study）
+const samePath = (a, b) =>
+  resolve(a).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() ===
+  resolve(b).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+
 check('route_path', ROUTE === '/api/learning', ROUTE)
 
 const root = resolveProjectRoot(undefined, repo)
-check('resolve_root_finds_repo', root.replace(/\\/g, '/').endsWith('/study'), root)
-check('resolve_explicit_wins', resolveProjectRoot(repo, 'C:/nope').replace(/\\/g, '/').endsWith('/study'))
+check('resolve_root_finds_repo', samePath(root, repo), root)
+check('resolve_explicit_wins', samePath(resolveProjectRoot(repo, 'C:/nope'), repo))
 
 const profile = await handleLearning({ action: 'profile' }, { root, python: 'python' })
 check('profile_status', profile.status === 200 && profile.payload.ok === true)
