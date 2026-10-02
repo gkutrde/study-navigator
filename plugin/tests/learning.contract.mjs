@@ -8,7 +8,7 @@
  */
 const src = new URL('../src/server/learning.ts', import.meta.url).href
 const mod = await import(src)
-const { handleLearning, resolveProjectRoot, buildCliArgs, ROUTE } = mod
+const { handleLearning, resolveProjectRoot, buildCliArgs, ROUTE, checkWorkspace, serveLearning, taskFileId } = mod
 
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -31,6 +31,9 @@ check('route_path', ROUTE === '/api/learning', ROUTE)
 const root = resolveProjectRoot(undefined, repo)
 check('resolve_root_finds_repo', samePath(root, repo), root)
 check('resolve_explicit_wins', samePath(resolveProjectRoot(repo, 'C:/nope'), repo))
+// plugin/ 自己也有 README.md：从插件目录往上找必须越过它，停在真正的项目根（有 profile/ + src/cli.py）
+const fromPlugin = resolveProjectRoot(undefined, join(repo, 'plugin', 'src'))
+check('resolve_root_skips_plugin_readme', samePath(fromPlugin, repo), fromPlugin)
 
 const profile = await handleLearning({ action: 'profile' }, { root, python: 'python' })
 check('profile_status', profile.status === 200 && profile.payload.ok === true)
@@ -100,6 +103,50 @@ const chatArgs = buildCliArgs('chat', { when: '2026-09-27 00:32', message: '缺�
 check('chat_args_not_shell_interpolated',
   chatArgs.length === 3 && chatArgs[1] === '2026-09-27 00:32' && chatArgs[2] === '缺什么？; rm -rf /',
   JSON.stringify(chatArgs))
+
+// ---------- T-050：只在「学习领航员」工作区启用（服务端过滤） ----------
+// 假的宿主工作区注册表：形状与 ctx.workspaceRegistry.get(id) 一致（0.1.5-rc.3 / 0.2.0-rc.1 源码核对）
+const registry = {
+  get(id) {
+    if (id === 'ws-learning') return { path: repo, title: '学习领航员' }
+    if (id === 'ws-other') return { path: repo, title: 'study-navigator' }
+    return undefined
+  },
+}
+
+check('gate_accepts_learning_workspace', checkWorkspace(registry, 'ws-learning').ok === true)
+const otherGate = checkWorkspace(registry, 'ws-other')
+check('gate_rejects_other_workspace', otherGate.ok === false && otherGate.status === 403 && /学习领航员/.test(otherGate.message),
+  otherGate.message)
+const missingGate = checkWorkspace(registry, '')
+check('gate_rejects_missing_workspace', missingGate.ok === false && missingGate.status === 403, missingGate.message)
+const unknownGate = checkWorkspace(registry, 'ws-ghost')
+check('gate_rejects_unknown_workspace', unknownGate.ok === false && unknownGate.status === 403, unknownGate.message)
+const noRegistry = checkWorkspace(undefined, 'ws-learning')
+check('gate_fails_closed_without_registry', noRegistry.ok === false && noRegistry.status === 503, noRegistry.message)
+const throwing = checkWorkspace({ get() { throw new Error('boom') } }, 'ws-learning')
+check('gate_survives_registry_errors', throwing.ok === false && throwing.status === 403, throwing.message)
+
+// 客户端自报的标题不算数：只认注册表
+const forged = await serveLearning({ action: 'profile', workspaceId: 'ws-other', workspaceTitle: '学习领航员' }, { registry })
+check('serve_ignores_forged_title', forged.status === 403 && forged.payload.ok === false, forged.payload.message)
+
+const served = await serveLearning({ action: 'profile', workspaceId: 'ws-learning' }, { registry, cwd: 'C:/' })
+check('serve_defaults_root_to_workspace_path',
+  served.status === 200 && served.payload.ok === true && samePath(served.payload.projectRoot, repo),
+  String(served.payload.projectRoot))
+
+const servedOverride = await serveLearning(
+  { action: 'tasks', workspaceId: 'ws-learning', projectRoot: 'C:/Windows' }, { registry })
+check('serve_project_root_override_still_checked', servedOverride.status === 400 && /找不到项目/.test(servedOverride.payload.message),
+  servedOverride.payload.message)
+
+const rejectedCli = await serveLearning({ action: 'next', workspaceId: 'ws-other' }, { registry })
+check('serve_rejects_cli_outside_workspace', rejectedCli.status === 403, rejectedCli.payload.message)
+
+// handoff 文件名与 Python 的 handoff.task_file_id 同一规则（逐条对照值由 pytest 侧核对）
+check('task_file_id_basic', taskFileId('2026-09-27 10:30') === '2026-09-27-1030', taskFileId('2026-09-27 10:30'))
+check('task_file_id_no_traversal', !/[\\/]/.test(taskFileId('../../etc/passwd 10:30')), taskFileId('../../etc/passwd 10:30'))
 
 console.log(failed === 0 ? 'ALL CHECKS PASSED' : failed + ' CHECK(S) FAILED')
 process.exit(failed === 0 ? 0 : 1)

@@ -30,7 +30,8 @@
   },
   "scripts": {
     "build": "tsdown",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node tests/learning.contract.mjs && node tests/client.contract.mjs"
   },
   "engines": {
     "node": ">=22"
@@ -39,6 +40,7 @@
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
+    "@types/node": "^22.20.4",
     "@types/react": "^19.0.0",
     "react": "^19.0.0",
     "tsdown": "^0.15.0",
