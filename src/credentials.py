@@ -25,7 +25,8 @@ def parse_env_file(path: Path | str) -> dict[str, str]:
         raise CredentialError(f"找不到 .env 文件：{p}（请复制 .env.example 并填入飞书凭证）")
 
     values: dict[str, str] = {}
-    for raw in p.read_text(encoding="utf-8-sig").splitlines():
+    # errors="replace"：.env 被存成 GBK 等编码时，键名与 ASCII 值照样读得出来（以前直接抛 UnicodeDecodeError）
+    for raw in p.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue

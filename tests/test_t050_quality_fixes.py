@@ -95,6 +95,41 @@ def test_extract_json_tolerates_real_model_output(raw, expected):
     assert extract_json(raw) == expected
 
 
+INNER_FENCE_TASK = {
+    "goal": "做列表",
+    "skills": ["列表"],
+    "acceptance": "能打印",
+    "steps": ["参考 ```python\nprint(xs[0])\n```"],
+}
+
+
+@pytest.mark.parametrize("pretty", [False, True])
+@pytest.mark.parametrize("fenced", [False, True])
+def test_code_fence_inside_json_string_is_not_taken_as_the_fence(pretty, fenced):
+    """JSON 字符串值里出现 ``` 时，不能把它当成围栏截出半截 JSON（审查发现：未锚定的围栏正则会取错值）。"""
+    import json
+
+    from src.planner import parse_task
+
+    body = json.dumps(INNER_FENCE_TASK, ensure_ascii=False, indent=2 if pretty else None)
+    raw = "```json\n" + body + "\n```" if fenced else body
+    task = parse_task(raw)
+
+    assert task.goal == "做列表"
+    assert task.steps == INNER_FENCE_TASK["steps"]
+
+
+def test_syllabus_point_with_code_fence_survives():
+    import json
+
+    from src.syllabus import parse_chapters
+
+    chapters = [{"chapter": "第 1 章", "points": ["数组字面量 ```js\nlet a=[1]\n```"]}]
+    parsed = parse_chapters("```json\n" + json.dumps(chapters, ensure_ascii=False, indent=2) + "\n```")
+
+    assert parsed[0].points == chapters[0]["points"]
+
+
 @pytest.mark.parametrize("raw, reason", [("", "empty"), ("   ", "empty"), ("没有任何 JSON", "missing"), ("{oops", "invalid")])
 def test_extract_json_reports_reason(raw, reason):
     from src.llm import JSONExtractionError, extract_json
@@ -330,6 +365,58 @@ def test_board_review_feeds_weaknesses(tmp_path, monkeypatch):
     assert result.ok, result.output
     assert weaknesses_text(directory) == ["缩进混乱", "忘记闭合标签"]
     assert "提交时间" in (directory / "tasks.md").read_text(encoding="utf-8")
+
+
+def test_board_review_reports_unknown_task_before_llm_config(tmp_path, monkeypatch):
+    """时间戳写错时先报「没有这个任务」，不要先报 LLM 配置问题（也不该去建 LLM 客户端）。"""
+    from src import cli
+
+    directory = _handoff_dir(tmp_path)
+
+    def must_not_build(**kwargs):
+        raise AssertionError("任务不存在时不该建 LLM 客户端")
+
+    monkeypatch.setattr(cli, "make_llm_completer", must_not_build)
+    board = cli._build_board(
+        tmp_path / ".env", tmp_path / "notes", directory / "knowledge.md", directory / "tasks.md", None
+    )
+
+    result = board.run_action("review", {"task": "2099-01-01 00:00", "code": "x"})
+
+    assert not result.ok
+    assert "没有时间戳为「2099-01-01 00:00」的块" in result.output
+
+
+def test_env_file_in_gbk_still_yields_ascii_values(tmp_path):
+    """.env 被存成 GBK（中文注释）时，ASCII 的键值照样读得出来（以前整份解析失败、静默变空）。"""
+    from src.cli import _read_env_value
+    from src.credentials import parse_env_file
+
+    env = tmp_path / ".env"
+    env.write_bytes("# 学习库根节点\nFEISHU_ROOT_DOC=https://x.feishu.cn/wiki/abc\n".encode("gbk"))
+
+    assert parse_env_file(env)["FEISHU_ROOT_DOC"] == "https://x.feishu.cn/wiki/abc"
+    assert _read_env_value(env, "FEISHU_ROOT_DOC") == "https://x.feishu.cn/wiki/abc"
+
+
+def test_batch_distill_sends_lf_text_like_single_note(tmp_path):
+    """批量提炼按字节读一次后解码：换行要和 read_text 一样统一成 \\n（Windows 的 CRLF 笔记）。"""
+    from src.distill import distill_notes
+
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_bytes("# 列表\r\n列表用方括号定义。\r\n".encode("utf-8"))
+    seen: list = []
+
+    class Completer:
+        def complete(self, messages):
+            seen.append(messages[1]["content"])
+            return '[{"name": "列表", "level": "学过", "evidence": "列表用方括号定义"}]'
+
+    batch = distill_notes(notes, completer=Completer())
+
+    assert batch.ok
+    assert "\r" not in seen[0]
 
 
 def test_board_review_reports_llm_config_error_in_chinese(tmp_path, monkeypatch):

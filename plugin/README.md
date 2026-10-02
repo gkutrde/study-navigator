@@ -172,6 +172,10 @@ dsh plugin --profile web add <本目录绝对路径>
 
 客户端 `inject`：`['slots', 'sessions', 'workspaces', 'uiWorkspace']`（少声明一个，访问时宿主会拒绝）。
 
+> `inject` 数组里的服务是**必需**的：宿主没有它，插件这一半就不会启动。新加的 `uiWorkspace`（客户端）与
+> `workspaceRegistry`（服务端）在 0.1.5-rc.3 的 web 包里就有（`dsh-web-app@0.1.5-rc.3` 依赖 `dsh-client-ui-workspace`
+> 与 `dsh-workspace`，其会话控制器也在用 `ctx.workspaceRegistry`），0.2.0-rc.1 真机验证过——所以 0.1.5 的兜底路径仍然可达。
+
 ### 本插件挂载的 slot
 
 | slot 名 | 位置 |

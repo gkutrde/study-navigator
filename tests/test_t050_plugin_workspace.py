@@ -61,7 +61,16 @@ def test_server_contract_covers_workspace_gate():
 def test_handoff_file_id_matches_python():
     from src.handoff import task_file_id
 
-    stamps = ["2026-09-27 10:30", "2026-09-27 10:30:15", "2026-9-7 9:05", "复习：列表 10:00", "../../etc/passwd 10:30"]
+    stamps = [
+        "2026-09-27 10:30",
+        "2026-09-27 10:30:15",
+        "2026-9-7 9:05",
+        "复习：列表 10:00",
+        "../../etc/passwd 10:30",
+        "Ünïcode éte 10:30",  # 非 ASCII、非 CJK 的字母：Python 的 \w 认，JS 的 \w 不认
+        "テスト 한국어 10:30",
+        "２０２６ ① 10:30",  # 全角数字 / 带圈数字
+    ]
     probe = (
         "const m = await import(new URL('./src/server/learning.ts', 'file:///' + process.cwd().replace(/\\\\/g, '/') + '/'));"
         "console.log(JSON.stringify(" + json.dumps(stamps) + ".map((s) => m.taskFileId(s))))"

@@ -227,7 +227,14 @@ PANEL_JS = """
         var data = null;
         try { data = JSON.parse(text); } catch (err) { data = null; }
         if (!data || typeof data !== "object") {
-          data = { ok: false, message: "服务端返回了无法解析的内容（HTTP " + response.status + "）" };
+          // 纯文本的短原因（比如来源校验的 403）直接给人看；HTML 错误页之类的就只报状态码
+          var brief = text && text.length < 200 && text.indexOf("<") === -1 ? text : "";
+          data = {
+            ok: false,
+            message: brief
+              ? "HTTP " + response.status + "：" + brief
+              : "服务端返回了无法解析的内容（HTTP " + response.status + "）"
+          };
         }
         if (!response.ok) { data.ok = false; }
         return data;
@@ -1027,6 +1034,8 @@ class TaskBoard:
             from .planner import normalize_topics
 
             raw = params.get("topics")
+            if raw is not None and not isinstance(raw, (str, list)):
+                raise ActionError("topics 必须是主题名列表")
             topics = normalize_topics(raw)
             if isinstance(raw, list) and not topics:
                 raise ActionError("至少要选一个主题：当前一个都没选，无法出题")
@@ -1874,7 +1883,8 @@ def _make_handler() -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(payload)
+            if self.command != "HEAD":  # HEAD 只回头部
+                self.wfile.write(payload)
 
         do_PUT = do_DELETE = do_PATCH = _reject  # noqa: N815
 

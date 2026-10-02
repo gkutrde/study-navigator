@@ -275,10 +275,11 @@ function readTasks(root) {
 *
 * 与 Python 的 handoff.task_file_id 同一规则（那边是唯一权威）：去掉冒号，其余不安全字符压成 "-"，
 * 首尾的 - . _ 去掉。"2026-09-27 10:30" → "2026-09-27-1030"。
+* Python 的 \w 是 Unicode 字母/数字/下划线，这里用 \p{L}\p{N}_（u 标志）对齐，不只认 ASCII 与 CJK。
 * 路径分隔符、.. 都会被压掉，拼不出 handoff 目录以外的路径。
 */
 function taskFileId(when) {
-	return String(when ?? "").trim().replace(/[:：]/g, "").replace(/[^\w\u4e00-\u9fff.-]+/g, "-").replace(/^[-._]+|[-._]+$/g, "");
+	return String(when ?? "").trim().replace(/[:：]/g, "").replace(/[^\p{L}\p{N}_\u4e00-\u9fff.-]+/gu, "-").replace(/^[-._]+|[-._]+$/g, "");
 }
 /**
 * 读某道任务的接力上下文（handoff），给「讨论」按钮预填用。

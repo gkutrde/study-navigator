@@ -972,6 +972,9 @@ def _build_board(
         from .planner import PlannerError
         from .review import ReviewError
 
+        # 先确认任务存在再建 LLM 客户端：时间戳写错时报「没有这个任务」，而不是先报 LLM 配置问题
+        if _find_task(record, task) is None:
+            raise RuntimeError(f"任务记录里没有时间戳为「{task}」的块")
         try:
             completer = make_llm_completer(env_path=env_path, home=home)
             return _review_and_record(record, task, code, completer).render()

@@ -339,9 +339,11 @@ class LLMClient:
 
 # --- 从 LLM 回复里取 JSON（提炼 / 出题 / 对齐 / 导入地图共用） -------------------
 
-# 注意必须是 raw string：曾经 planner 里写成普通字符串 "\\\\s"，正则变成匹配字面量 \s，
-# 围栏分支从来没生效过（只是靠后面的 raw_decode 兜住了）。
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL)
+# 围栏必须**独占一行**（开头的 ``` 在行首、结尾的 ``` 独占一行）：JSON 字符串值里也可能出现 ```
+# （比如步骤里写「参考 ```python …```」），不锚定行首的话会把那里当成围栏，取出半截 JSON。
+# 合法 JSON 的字符串里不会有真换行，所以行首锚定的围栏不会落在字符串内部。
+# 另：必须是 raw string——曾经 planner 写成普通字符串 "\\\\s"，正则匹配的是字面量 \s，围栏分支从来没生效过。
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?[ \t]*\n(.*?)\n```[ \t]*$", re.MULTILINE | re.DOTALL)
 _JSON_DECODER = json.JSONDecoder()
 
 

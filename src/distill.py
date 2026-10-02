@@ -337,7 +337,8 @@ def distill_notes(
             continue
 
         report("提炼中")
-        text = data.decode("utf-8", errors="replace")
+        # 与 read_text 一样把 \r\n / \r 统一成 \n（Windows 上同步下来的笔记是 CRLF）
+        text = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
         try:
             points = distill_note(text, completer=completer, source=str(path))
         except DistillError as exc:

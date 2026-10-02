@@ -256,6 +256,33 @@ def test_board_keeps_only_the_latest_result(tmp_path):
     assert not hasattr(board, "_results"), "以前整段会话的结果都攒在列表里"
 
 
+def test_head_rejection_has_no_body(served):
+    _, port = served
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request("HEAD", "/", headers={"Host": "evil.example"})
+        response = conn.getresponse()
+        assert response.status == 403
+        assert response.read() == b""
+    finally:
+        conn.close()
+
+
+def test_bad_topics_type_is_400_not_500(tmp_path):
+    _, board = _board_with_tasks(tmp_path, operations={"next": lambda topics: "ok"})
+
+    result = board.run_action("next", {"topics": 5})
+
+    assert result.status == 400 and "topics" in result.output
+
+
+def test_panel_js_shows_plain_text_reason():
+    """来源校验的 403 是纯文本：面板要把原因给人看，而不是只报状态码。"""
+    from src.dashboard import PANEL_JS
+
+    assert '"HTTP " + response.status + "：" + brief' in PANEL_JS
+
+
 def test_missing_required_param_message_is_not_double_prefixed(tmp_path):
     _, board = _board_with_tasks(tmp_path, operations={"explain": lambda name: name})
 
