@@ -1,17 +1,20 @@
-"""T-012：本地只读看板（serve 命令）。
+"""本地互动看板（serve 命令）：T-012 起步的只读看板，T-013 起升级为「固定动作集」交互版。
 
-边界（[[04-任务与验收清单]] T-012）：
+边界（[[01-需求与范围确认]]「明确不做」、[[02-系统架构]] 2026-09-27 决策）：
 
 - 只用标准库 http.server，绑定 localhost（127.0.0.1），默认端口 8765；
-- **只读**：只接受 GET/HEAD，任何写方法（POST/PUT/DELETE/PATCH）一律 405，不存在写接口；
-- 把 profile/knowledge.md、profile/tasks.md、profile/syllabus.md 渲染成 HTML；
-- 每次请求现读文件（单机自用，量级很小），服务期间与停服后都不改动任何文件；
-- 样式从简、留白，方便客户日后自己美化练手。
+- 页面是 GET；写操作只有 POST /action/<固定动作>（动作名与入参键都走白名单），
+  **没有任何自由命令入口**；PUT/DELETE/PATCH 一律 405；
+- 只读文件端点 /file 只认项目目录内的相对路径（挡绝对路径与 .. 穿越）；
+- 请求来源校验（T-050）：Host 必须是本机回环名（挡 DNS rebinding），
+  写请求带了 Origin/Referer 就必须同源（挡别的网站用表单偷偷触发动作）；
+- 每次请求现读文件（单机自用，量级很小）；
+- 视觉层（PANEL_STYLE / PANEL_JS）内联、零外部依赖，与渲染逻辑分开存放。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -19,12 +22,12 @@ import os
 from pathlib import Path
 import html
 import re
-from typing import Callable
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
-from .planner import REVIEW_FLAG
+from .planner import is_review_record
 
 from .profile import (
+    DEFAULT_TOPIC,
     LEVELS,
     KnowledgeProfile,
     ProfileError,
@@ -166,13 +169,13 @@ select:focus,input:focus{outline:2px solid var(--accent-weak); border-color:var(
 .nav a.active{font-weight:600; text-decoration:underline}
 .topic-filter{display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; margin-top:.5rem}
 .topic-item{display:flex; align-items:center; gap:.25rem; font-size:.88rem; cursor:pointer}
-  /* 任务卡里是 markdown 渲染结果：收敛标题层级，避免与区块标题打架 */
-  .task-card h1{font-size:1.05rem; margin:.2rem 0 .6rem; color:var(--muted); font-weight:600}
-  .task-card h2{font-size:1.05rem; margin:1rem 0 .4rem}
-  .task-card h3{font-size:.95rem; margin:.8rem 0 .3rem; color:var(--text)}
-  .task-card p{margin:.35rem 0}
-  .task-card ol,.task-card ul{margin:.3rem 0 .3rem 1.1rem; padding:0}
-  .task-card li{margin:.18rem 0}
+/* 任务卡里是 markdown 渲染结果：收敛标题层级，避免与区块标题打架 */
+.task-card h1{font-size:1.05rem; margin:.2rem 0 .6rem; color:var(--muted); font-weight:600}
+.task-card h2{font-size:1.05rem; margin:1rem 0 .4rem}
+.task-card h3{font-size:.95rem; margin:.8rem 0 .3rem; color:var(--text)}
+.task-card p{margin:.35rem 0}
+.task-card ol,.task-card ul{margin:.3rem 0 .3rem 1.1rem; padding:0}
+.task-card li{margin:.18rem 0}
 .result-ok,.result-err{border-radius:12px; padding:.7rem .9rem; margin:.6rem 0; font-size:.92rem; border:1px solid transparent}
 .result-ok{background:var(--done-bg); color:#0b6b3d; border-color:#bfe6d3}
 .result-err{background:#fdecec; color:#a3302b; border-color:#f5c6c4}
@@ -210,6 +213,28 @@ PANEL_JS = """
   document.documentElement.className += " js";
 
   // 渐进增强：没有 JS 时表单照旧能提交（POST 后 303 回跳），下面只是把体验做顺。
+
+  // ---- 0. 所有原地动作共用一个请求函数：POST JSON → 结果对象 {ok, message, ...} ----
+  // 服务端回了非 JSON（比如 500 的纯文本）也给出带状态码的中文原因，
+  // 只有真正连不上时才走调用方的 catch（"网络错误"）。
+  function postAction(url, payload) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).then(function (response) {
+      return response.text().then(function (text) {
+        var data = null;
+        try { data = JSON.parse(text); } catch (err) { data = null; }
+        if (!data || typeof data !== "object") {
+          data = { ok: false, message: "服务端返回了无法解析的内容（HTTP " + response.status + "）" };
+        }
+        if (!response.ok) { data.ok = false; }
+        return data;
+      });
+    });
+  }
+
   // ---- 1. 提交后禁用按钮，避免连点 ----
   document.querySelectorAll("form[action^='/action/']").forEach(function (form) {
     form.addEventListener("submit", function () {
@@ -269,23 +294,16 @@ PANEL_JS = """
     var payload = { name: form.querySelector('input[name="name"]').value, level: select.value };
     select.disabled = true;
     clearInlineError(box);
-    fetch("/action/status", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    }).then(function (response) {
-      return response.json().then(function (data) { return { ok: response.ok, data: data }; });
-    }).then(function (result) {
+    postAction("/action/status", payload).then(function (data) {
       select.disabled = false;
-      if (!result.ok || !result.data.ok) {
+      if (!data.ok) {
         revertSelect(select, box);
-        showInlineError(box, result.data.message || "保存失败，请重试");
+        showInlineError(box, data.message || "保存失败，请重试");
         return;
       }
-      applyCardLevel(card, result.data.level);
-      applyCounts(result.data.counts || {});
-      var slot = box.querySelector(".inline-error");
-      if (slot) { slot.hidden = true; }
+      applyCardLevel(card, data.level);
+      applyCounts(data.counts || {});
+      clearInlineError(box);
     }).catch(function () {
       select.disabled = false;
       revertSelect(select, box);
@@ -311,7 +329,7 @@ PANEL_JS = """
     });
   });
 
-  // ---- 2.5 出题主题多选：选择记进 localStorage（T-029）----',
+  // ---- 2.5 出题主题多选：选择记进 localStorage（T-029）----
   var TOPIC_KEY = "study-navigator.topics";
   var topicBoxes = document.querySelectorAll('.topic-filter input[name="topics"]');
   if (topicBoxes.length) {
@@ -360,7 +378,9 @@ PANEL_JS = """
   window.addEventListener("hashchange", revealAnchor);
 
   // ---- 2.8 聊天面板（T-034）：就地连续对话，不刷新、不跳滚动 ----
-  function chatSay(log, who, text) {
+  // markup 只来自服务端：已经转义过再渲染的 markdown（与刷新后看到的历史同一个渲染器）。
+  // 用户输入永远走 textContent，不当 HTML 解析（T-037 的 XSS 约定）。
+  function chatSay(log, who, text, markup) {
     var turn = document.createElement("div");
     turn.className = "chat-turn " + (who === "你" ? "chat-user" : "chat-assistant");
     var label = document.createElement("span");
@@ -368,7 +388,12 @@ PANEL_JS = """
     label.textContent = who;
     var body = document.createElement("div");
     body.className = "chat-text";
-    body.textContent = text;
+    if (markup) {
+      body.className += " chat-markdown";
+      body.innerHTML = markup;
+    } else {
+      body.textContent = text;
+    }
     turn.appendChild(label);
     turn.appendChild(body);
     log.appendChild(turn);
@@ -396,20 +421,14 @@ PANEL_JS = """
     pending.textContent = "DSH 正在回答…";
     log.appendChild(pending);
 
-    fetch("/action/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task: task, message: message })
-    }).then(function (response) {
-      return response.json();
-    }).then(function (data) {
+    postAction("/action/chat", { task: task, message: message }).then(function (data) {
       pending.remove();
       if (button) { button.disabled = false; }
       if (!data.ok) {
         chatError(panel, data.message || "追问失败，请重试");
         return;
       }
-      chatSay(log, "DSH", data.output || "(空回答)");
+      chatSay(log, "DSH", data.output || "(空回答)", data.html);
     }).catch(function () {
       pending.remove();
       if (button) { button.disabled = false; }
@@ -444,27 +463,22 @@ PANEL_JS = """
     }
   });
 
-  // ---- 3. 任务卡片上的知识点 chip = 行内讲解（T-027，走 explain 缓存）----',
+  // ---- 3. 任务卡片上的知识点 chip = 行内讲解（T-027，走 explain 缓存）----
   function showExplanation(chip) {
     var slot = document.getElementById("explain-slot");
     if (!slot) { return; }
     var name = chip.dataset.explain;
     slot.hidden = false;
     slot.textContent = "正在取「" + name + "」的讲解…";
-    fetch("/action/explain", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name })
-    }).then(function (response) {
-      return response.json().then(function (data) { return { ok: response.ok, data: data }; });
-    }).then(function (result) {
-      if (!result.ok || !result.data.ok) {
-        slot.textContent = "讲解失败：" + (result.data.message || "请重试");
+    postAction("/action/explain", { name: name }).then(function (data) {
+      if (!data.ok) {
+        // 服务端的失败消息已经自带「讲解 失败：」前缀，这里不再叠一层
+        slot.textContent = data.message || "讲解失败，请重试";
         slot.classList.add("result-err");
         return;
       }
       slot.classList.remove("result-err");
-      slot.textContent = result.data.output || "(空)";
+      slot.textContent = data.output || "(空)";
     }).catch(function () {
       slot.classList.add("result-err");
       slot.textContent = "网络错误：取讲解失败，请重试";
@@ -478,25 +492,19 @@ PANEL_JS = """
     });
   });
 
-  // ---- 4. 任务卡片上的「删除」----'
+  // ---- 4. 任务卡片上的「删除」----
   document.querySelectorAll("[data-delete-task]").forEach(function (button) {
     button.addEventListener("click", function (event) {
       event.preventDefault();
       var when = button.dataset.deleteTask;
       if (!window.confirm("删除任务 " + when + " ？")) { return; }
-      fetch("/action/delete_task", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ when: when })
-      }).then(function (response) { return response.json(); }).then(function (data) {
+      var card = button.closest(".task-card");
+      postAction("/action/delete_task", { when: when }).then(function (data) {
         if (data.ok) {
-          var card = button.closest(".task-card");
           if (card) { card.remove(); }
-        } else {
-          var box = button.closest(".task-card");
-          var slot = box ? box.querySelector(".inline-error") : null;
-          if (slot) { slot.textContent = data.message || "删除失败"; slot.hidden = false; }
+          return;
         }
+        if (card) { showInlineError(card, data.message || "删除失败"); }
       }).catch(function () { window.alert("网络错误：删除失败，请重试"); });
     });
   });
@@ -538,6 +546,54 @@ def _tokenize_table(lines: "list[str]", index: int) -> "tuple | None":
 FENCE = chr(96) * 3
 # T-037：在线查看的文本文件上限（防止把大文件灌进响应）
 MAX_SERVED_FILE_BYTES = 512 * 1024
+# 请求体上限：动作入参都很小（代码提交本身就截到 8000 字符），1 MiB 绰绰有余
+MAX_REQUEST_BYTES = 1024 * 1024
+# 本机回环名：看板只绑 127.0.0.1，浏览器里合法的 Host 只有这几种写法
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _authority(value: str) -> tuple[str, int | None] | None:
+    """把 Host 头或 Origin/Referer 拆成 (主机名, 端口)；拆不出返回 None。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text if "//" in text else "//" + text)
+        return (parts.hostname or "").lower(), parts.port
+    except ValueError:  # 端口不是数字之类的畸形值
+        return None
+
+
+def request_guard(method: str, host: str = "", origin: str = "", referer: str = "") -> str | None:
+    """请求来源校验：返回拒绝原因（中文），None 表示放行。
+
+    看板只绑本机，但浏览器里**任何网站**都能往 127.0.0.1 发请求：
+    - DNS rebinding：攻击者域名解析到 127.0.0.1，浏览器把它当同源——此时 Host 头是攻击者域名，
+      所以 Host 必须是本机回环名（GET 也查：/file 端点能读项目文件）；
+    - 跨站表单：别的网站用 <form method=post action="http://127.0.0.1:8765/action/chat"> 就能
+      触发动作（chat 会起一个能读写项目目录的 dsh 进程）——浏览器发跨站 POST 一定带 Origin，
+      所以写请求带了 Origin/Referer 就必须与 Host 同源。
+    都不带 Origin/Referer 的写请求（命令行工具、测试）照常放行。
+    这不是登录鉴权（01「明确不做」），只是确认请求真的来自看板自己的页面。
+    """
+    if host:
+        authority = _authority(host)
+        if authority is None or authority[0] not in LOOPBACK_HOSTS:
+            return "只接受本机访问（Host 不是 127.0.0.1 / localhost）"
+    if str(method or "").upper() not in ("POST", "PUT", "DELETE", "PATCH"):
+        return None
+    source = origin or referer
+    if not source:
+        return None
+    if source.strip().lower() == "null":
+        return "拒绝来源不明的写请求（Origin: null）"
+    claimed = _authority(source)
+    expected = _authority(host) if host else None
+    if claimed is None or claimed[0] not in LOOPBACK_HOSTS:
+        return "拒绝跨站写请求：动作只能从看板页面本身发起"
+    if expected is not None and claimed != expected:
+        return "拒绝跨站写请求：动作只能从看板页面本身发起"
+    return None
 # 项目根的标志文件：往上找到含这些的目录就当项目根
 _PROJECT_MARKERS = ("README.md", ".git", "pyproject.toml", "setup.py")
 
@@ -553,7 +609,6 @@ def _guess_project_root(profile_dir: Path) -> Path:
             break
         current = parent
     return Path(profile_dir).resolve().parent
-TICK = chr(96)
 
 
 # 只把这些前缀下的路径变成可点链接（都在项目目录里，且端点还会再校验一次）
@@ -668,12 +723,17 @@ def markdown_to_html(markdown: str) -> str:
     return "\n".join(out)
 
 
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+# 行内代码：一串反引号 … 同样长度的一串反引号。必须是 raw string——
+# 以前写成普通字符串 "(" + TICK + "+)(.+?)\1"，"\1" 变成了控制字符 \x01，行内代码从来没渲染过。
+_INLINE_CODE_RE = re.compile(r"(`+)(.+?)\1")
+
+
 def _inline(text: str) -> str:
     """行内元素：先转义再处理粗体与行内代码。"""
     escaped = html.escape(text)
-    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
-    escaped = re.sub("(" + TICK + "+)(.+?)\1", r"<code>\2</code>", escaped)
-    return escaped
+    escaped = _BOLD_RE.sub(r"<strong>\1</strong>", escaped)
+    return _INLINE_CODE_RE.sub(r"<code>\2</code>", escaped)
 
 
 def render_page(title: str, body: str, *, nav: str = "", meta: str = "") -> str:
@@ -825,6 +885,8 @@ def terminal_popup_enabled(environ=None) -> bool:
     source = os.environ if environ is None else environ
     raw = str(source.get(TERMINAL_POPUP_ENV, "") or "").strip().lower()
     return raw in TRUTHY
+
+
 STATUS_ACTION = "status"
 # 动作允许的入参键白名单：多给任何键一律拒绝（防止变成自由命令入口）
 ACTION_PARAM_KEYS = {
@@ -849,8 +911,25 @@ ACTION_PARAM_KEYS = {
 }
 
 
+# 只需要「若干必填文本参数」的动作：(参数名, 缺失时的中文提示)，按顺序作为位置参数传给 operation。
+# done / next / review 的入参规则不同（可空 / 多选 / 代码不裁空白），在 _operation_args 里单独处理。
+REQUIRED_PARAMS = {
+    "explain": (("name", "讲解需要一个知识点名称"),),
+    "delete_task": (("when", "删除任务需要给出时间戳（when）"),),
+    "handoff": (("task", "DSH 接力需要给出任务时间戳（task）"),),
+    "chat": (("task", "追问需要给出任务时间戳（task）"), ("message", "追问需要给出消息内容（message）")),
+}
+
+
 class ActionError(RuntimeError):
     """动作不存在、参数非法或执行失败。"""
+
+
+def _required(params: dict, key: str, message: str) -> str:
+    value = str(params.get(key, "")).strip()
+    if not value:
+        raise ActionError(message)
+    return value
 
 
 @dataclass
@@ -890,7 +969,8 @@ class TaskBoard:
         self.tasks_path = self.profile_dir / "tasks.md"
         self.syllabus_path = self.profile_dir / "syllabus.md"
         self._operations = dict(operations or {})
-        self._results: list[ActionResult] = []
+        # 页面只展示「最近一次」动作结果：只留这一条（以前整段会话的结果全攒在列表里只增不减）
+        self._last: ActionResult | None = None
         self._counter = 0
 
     # --- 动作 ---
@@ -933,65 +1013,38 @@ class TaskBoard:
             action_id=self._counter,
             timestamp=f"{datetime.now():%Y-%m-%d %H:%M:%S}",
         )
-        self._results.append(result)
+        self._last = result
         return result
+
+    @staticmethod
+    def _operation_args(name: str, params: dict) -> tuple:
+        """把白名单内的入参整理成 operation 的位置参数；缺必填参数抛 ActionError。"""
+        if name == "done":
+            # 三个都可空：缺什么由 done 命令自己报（它的提示更具体）
+            return (params.get("name", ""), params.get("path", ""), params.get("recite", ""))
+        if name == "next":
+            # T-029：主题多选；一个都不选时明确报错，不硬出题
+            from .planner import normalize_topics
+
+            raw = params.get("topics")
+            topics = normalize_topics(raw)
+            if isinstance(raw, list) and not topics:
+                raise ActionError("至少要选一个主题：当前一个都没选，无法出题")
+            return (topics or None,)
+        if name == "review":
+            task = _required(params, "task", "提交作业需要给出任务时间戳（task）")
+            if "code" not in params:
+                raise ActionError("提交作业需要给出代码（code）")
+            return (task, str(params.get("code", "")))  # 代码原样，不裁首尾空白
+        return tuple(_required(params, key, message) for key, message in REQUIRED_PARAMS.get(name, ()))
 
     def _run_operation(self, name: str, params: dict) -> str:
         operation = self._operations.get(name)
         if operation is None:
             raise ActionError(f"动作 {name} 未接线（请通过 serve 启动）")
+        args = self._operation_args(name, params)
         try:
-            if name == "done":
-                return str(
-                    operation(
-                        params.get("name", ""),
-                        params.get("path", ""),
-                        params.get("recite", ""),
-                    )
-                )
-            if name == "explain":
-                target = str(params.get("name", "")).strip()
-                if not target:
-                    raise ActionError("讲解需要一个知识点名称")
-                return str(operation(target))
-            if name == "delete_task":
-                when = str(params.get("when", "")).strip()
-                if not when:
-                    raise ActionError("删除任务需要给出时间戳（when）")
-                return str(operation(when))
-            if name == "next":
-                # T-029：主题多选；一个都不选时明确报错，不硬出题
-                from .planner import normalize_topics
-
-                raw = params.get("topics")
-                topics = normalize_topics(raw)
-                if isinstance(raw, list) and not topics:
-                    raise ActionError("至少要选一个主题：当前一个都没选，无法出题")
-                return str(operation(topics or None))
-
-            if name == "handoff":
-                task = str(params.get("task", "")).strip()
-                if not task:
-                    raise ActionError("DSH 接力需要给出任务时间戳（task）")
-                return str(operation(task))
-
-            if name == "chat":
-                task = str(params.get("task", "")).strip()
-                if not task:
-                    raise ActionError("追问需要给出任务时间戳（task）")
-                message = str(params.get("message", "")).strip()
-                if not message:
-                    raise ActionError("追问需要给出消息内容（message）")
-                return str(operation(task, message))
-
-            if name == "review":
-                task = str(params.get("task", "")).strip()
-                if not task:
-                    raise ActionError("提交作业需要给出任务时间戳（task）")
-                if "code" not in params:
-                    raise ActionError("提交作业需要给出代码（code）")
-                return str(operation(task, str(params.get("code", ""))))
-            return str(operation())
+            return str(operation(*args))
         except Exception as exc:  # 外部接口失败不该把看板打崩
             raise ActionError(f"{ACTION_LABELS.get(name, name)} 失败：{exc}") from None
 
@@ -1031,7 +1084,7 @@ class TaskBoard:
     # --- 展示 ---
 
     def last_result(self) -> ActionResult | None:
-        return self._results[-1] if self._results else None
+        return self._last
 
     def _result_banner(self, *, for_action: str | None = None) -> str:
         result = self.last_result()
@@ -1264,8 +1317,7 @@ class TaskBoard:
         """首页只做概览：动作区 + 四态统计 + 最近 7 天 + 最近一条任务。"""
         profile = self._load_profile()
         records = self._task_records()
-        sections = [self._toolbar(), self._stats(profile.counts())]
-        sections.insert(1, self._recent_block())
+        sections = [self._toolbar(), self._recent_block(), self._stats(profile.counts())]
         sections.append(
             f'<p class="meta">画像 {len(profile.points)} 个知识点 ｜ 任务 {len(records)} 条 ｜ '
             f'<a href="/knowledge">看画像</a> · <a href="/tasks">看任务</a> · '
@@ -1283,7 +1335,7 @@ class TaskBoard:
         profile = self._load_profile()
         by_topic: dict[str, list] = {}
         for point in profile.points:
-            by_topic.setdefault(point.topic or "未分类", []).append(point)
+            by_topic.setdefault(point.topic or DEFAULT_TOPIC, []).append(point)
 
         sections = [self._toolbar(), self._stats(profile.counts()), self._weakness_block(), "<h2>知识画像</h2>"]
         if not profile.points:
@@ -1338,7 +1390,8 @@ class TaskBoard:
             else ""
         )
         reviews = "".join(self._review_block(item) for item in getattr(record, "reviews", []))
-        is_review = REVIEW_FLAG in (getattr(record, "raw", "") or "") or str(record.goal or "").startswith("复习")
+        # 与出题计数同一个判定（planner.is_review_record），角标与复习节奏不会各说各的
+        is_review = is_review_record(record)
         badge = '<span class="badge-review">复习</span>' if is_review else ""
         return (
             f'<div class="task-card" id="{anchor or task_anchor(record.when)}" '
@@ -1427,7 +1480,8 @@ class TaskBoard:
 
         log = "".join(self._chat_turn(turn) for turn in turns)
         return (
-            f'<div class="chat-panel" id="chat-panel" data-chat-task="{html.escape(record.when)}">'
+            # 每张任务卡都有一个面板：不能用固定 id（以前是 id="chat-panel"，多张卡就重复了，HTML 非法）
+            f'<div class="chat-panel" data-chat-task="{html.escape(record.when)}">'
             f'<button type="button" class="btn-chat-toggle" data-chat-toggle>'
             f"\U0001F4AC 展开聊天面板（就地连续追问）</button>"
             f'<div class="chat-body" hidden>'
@@ -1609,6 +1663,9 @@ class Dashboard:
             return self._json_response(result.status, {"ok": False, "message": result.output})
 
         payload: dict = {"ok": True, "output": result.output}
+        if action == "chat":
+            # 面板就地渲染要和刷新后看到的历史一致：同一个 markdown 渲染器（先转义再渲染）
+            payload["html"] = linkify_project_paths(markdown_to_html(result.output))
         if action == STATUS_ACTION:
             payload.update(
                 {
@@ -1741,7 +1798,22 @@ def _make_handler() -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "StudyNavigator/1.0"
 
+        def _rejected(self) -> bool:
+            """请求来源校验（见 request_guard）；不合格就直接回 403。"""
+            reason = request_guard(
+                self.command,
+                host=self.headers.get("Host") or "",
+                origin=self.headers.get("Origin") or "",
+                referer=self.headers.get("Referer") or "",
+            )
+            if reason is None:
+                return False
+            self._plain(403, reason)
+            return True
+
         def _respond(self, with_body: bool) -> None:
+            if self._rejected():
+                return
             status, content_type, body = self.server.dashboard.handle_request(  # type: ignore[attr-defined]
                 self.command, self.path
             )
@@ -1764,7 +1836,19 @@ def _make_handler() -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             # T-026：body 与 Content-Type 交给 Dashboard 决定"JSON 原地更新"还是"表单 303 回跳"
-            length = int(self.headers.get("Content-Length") or 0)
+            if self._rejected():
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._plain(400, "Content-Length 不合法")
+                return
+            if length < 0:
+                self._plain(400, "Content-Length 不合法")
+                return
+            if length > MAX_REQUEST_BYTES:
+                self._plain(413, "请求体过大")
+                return
             raw = self.rfile.read(length) if length else b""
             # 用 handle_post_request（带响应头）而不是 handle_request——
             # handle_request 为了兼容只回 3 元组，会把 Location 丢掉。
