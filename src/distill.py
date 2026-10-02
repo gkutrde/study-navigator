@@ -13,10 +13,10 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
-import re
 from typing import Iterable, Sequence
 
-from .llm import LLMError
+from .fileio import write_text_atomic
+from .llm import JSONExtractionError, LLMError, extract_json
 
 # 三态与 [[模块-知识画像]] 一致
 DISTILL_LEVELS = ("学过", "做过", "存疑")
@@ -135,28 +135,14 @@ def parse_knowledge_points(raw: str, source: str = "", note_text: str = "") -> l
 
 
 def _extract_json(raw: str):
-    text = (raw or "").strip()
-    if not text:
-        raise DistillError("LLM 返回了空内容，无法解析知识点")
-
-    fenced = re.search("```(?:json)?\\s*(.+?)```", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1).strip()
-
-    if text.startswith("[") or text.startswith("{"):
-        candidate = text
-    else:
-        start = min(
-            (index for index in (text.find("["), text.find("{")) if index >= 0),
-            default=-1,
-        )
-        if start < 0:
-            raise DistillError("LLM 输出里找不到 JSON（prompt 要求只输出 JSON 数组），请重试")
-        candidate = text[start:]
     try:
-        return json.loads(candidate)
-    except ValueError as exc:
-        raise DistillError(f"LLM 输出的 JSON 无法解析：{exc}；请重试") from None
+        return extract_json(raw)
+    except JSONExtractionError as exc:
+        if exc.reason == "empty":
+            raise DistillError("LLM 返回了空内容，无法解析知识点") from None
+        if exc.reason == "missing":
+            raise DistillError("LLM 输出里找不到 JSON（prompt 要求只输出 JSON 数组），请重试") from None
+        raise DistillError(f"LLM 输出的 JSON 无法解析：{exc.detail}；请重试") from None
 
 
 def _is_heading_only(evidence: str) -> bool:
@@ -257,11 +243,14 @@ class DistillBatch:
 
 def file_fingerprint(path: Path | str) -> str:
     """笔记内容指纹（sha256）。用内容而不是 mtime：避免"只 touch 没改内容"也重跑。"""
-    target = Path(path)
     try:
-        data = target.read_bytes()
+        data = Path(path).read_bytes()
     except OSError:
         return ""
+    return _fingerprint(data)
+
+
+def _fingerprint(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
@@ -282,16 +271,10 @@ def load_distill_state(path: Path | str) -> dict:
 def save_distill_state(path: Path | str, state: dict) -> Path:
     """原子写状态文件（临时文件 + 替换），失败不影响主流程。"""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
     try:
-        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(target)
+        write_text_atomic(target, json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
     except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        pass  # 状态文件只是加速用的：写不进去下次就全量重跑，不该让提炼失败
     return target
 
 
@@ -333,46 +316,41 @@ def distill_notes(
     known = state if state is not None else {}
 
     for position, path in enumerate(notes, start=1):
-        fingerprint = file_fingerprint(path)
-        previous = known.get(path.name)
-        unchanged = (
-            not force
-            and isinstance(previous, dict)
-            and previous.get("hash") == fingerprint
-            and fingerprint != ""
-        )
-        if unchanged:
-            batch.skipped += 1
+
+        def report(status: str) -> None:
             if on_progress:
-                on_progress(position, total, path.name, "跳过（内容未变）")
-            continue
+                on_progress(position, total, path.name, status)
 
-        if on_progress:
-            on_progress(position, total, path.name, "提炼中")
-
+        # 每篇只读一次：指纹与正文来自同一份字节（以前先算指纹、再读正文，读两遍）
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            data = path.read_bytes()
         except OSError as exc:
             batch.failed.append((path.name, f"读取失败（{type(exc).__name__}）"))
-            if on_progress:
-                on_progress(position, total, path.name, "读取失败")
+            report("读取失败")
             continue
+
+        fingerprint = _fingerprint(data)
+        previous = known.get(path.name)
+        if not force and isinstance(previous, dict) and previous.get("hash") == fingerprint:
+            batch.skipped += 1
+            report("跳过（内容未变）")
+            continue
+
+        report("提炼中")
+        text = data.decode("utf-8", errors="replace")
         try:
             points = distill_note(text, completer=completer, source=str(path))
         except DistillError as exc:
             batch.failed.append((path.name, str(exc)))
-            if on_progress:
-                on_progress(position, total, path.name, "失败")
+            report("失败")
             continue
         except Exception as exc:  # 兜底：任何单篇异常都不该中断整批
             batch.failed.append((path.name, f"未预期错误：{type(exc).__name__}"))
-            if on_progress:
-                on_progress(position, total, path.name, "失败")
+            report("失败")
             continue
 
         batch.succeeded.append((path, points))
-        known[path.name] = {"hash": fingerprint, "size": path.stat().st_size if path.exists() else 0}
-        if on_progress:
-            on_progress(position, total, path.name, f"成功（{len(points)} 个知识点）")
+        known[path.name] = {"hash": fingerprint, "size": len(data)}
+        report(f"成功（{len(points)} 个知识点）")
 
     return batch

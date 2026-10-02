@@ -10,11 +10,14 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any, Iterable
 
 from .feishu import FeishuApiError, FeishuClient, scope_hint
+from .fileio import write_text_atomic
 
 # 飞书代码块 language 枚举 → 代码围栏语言标记（只列常见的，其余留空）
 CODE_LANGUAGES = {
@@ -93,6 +96,14 @@ CODE_LANGUAGES = {
 }
 
 _FENCE = "```"
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+# 块对象里的结构字段；剩下的那个键才是正文载荷（text / heading1 / bullet / …）
+_STRUCTURAL_KEYS = frozenset({"block_id", "parent_id", "children", "block_type", "comments"})
+
+
+def _payload_key(block: dict[str, Any]) -> str | None:
+    """取块的正文载荷键（飞书块只有一个非结构字段装正文）。"""
+    return next((key for key in block if key not in _STRUCTURAL_KEYS), None)
 
 
 def _elements_of(block: dict[str, Any], payload_key: str, document_id: str) -> list[dict[str, Any]]:
@@ -193,10 +204,7 @@ class _Renderer:
         for block in self._blocks:
             if isinstance(block, dict):
                 self._render_block(block, 0, lines)
-        text = "\n".join(lines)
-        while "\n\n\n" in text:
-            text = text.replace("\n\n\n", "\n\n")
-        return text.strip("\n")
+        return _BLANK_RUN_RE.sub("\n\n", "\n".join(lines)).strip("\n")
 
     def _render_block(self, block: dict[str, Any], depth: int, lines: list[str]) -> None:
         block_id = block.get("block_id")
@@ -251,7 +259,7 @@ class _Renderer:
         if block_type == 27:
             # 图片不下载，但保留位置标记；token 属于内部标识，不写进笔记正文
             return [f"{indent}[图片]"]
-        if block_type in (30,):
+        if block_type == 30:
             return [f"{indent}[内嵌表格]"]
         if block_type == 43:
             return [f"{indent}[内嵌看板]"]
@@ -271,16 +279,7 @@ class _Renderer:
             child = self._by_id.get(child_id)
             if not isinstance(child, dict):
                 continue
-            payload_key = child.get("payload_key")
-            if payload_key is None:
-                payload_key = next(
-                    (
-                        key
-                        for key in child
-                        if key not in {"block_id", "parent_id", "children", "block_type", "comments"}
-                    ),
-                    None,
-                )
+            payload_key = child.get("payload_key") or _payload_key(child)
             if payload_key is None:
                 continue
             text = _render_elements(_elements_of(child, payload_key, self._document_id)).strip()
@@ -340,19 +339,10 @@ def render_markdown(blocks: list[dict[str, Any]], document_id: str = "") -> str:
 
 def write_note_atomic(path: Path | str, content: str) -> Path:
     """先写 <path>.tmp，成功后再替换目标文件；失败不留下半成品。"""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_name(target.name + ".tmp")
     try:
-        tmp_path.write_text(content, encoding="utf-8")
-        tmp_path.replace(target)
+        return write_text_atomic(path, content)
     except OSError as exc:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise FeishuApiError(f"写入 {target} 失败：{type(exc).__name__}") from None
-    return target
+        raise FeishuApiError(f"写入 {Path(path)} 失败：{type(exc).__name__}") from None
 
 
 def sync_document(client: FeishuClient, document_id: str, notes_dir: Path | str) -> Path:
@@ -379,14 +369,7 @@ def _mention_child_tokens(blocks: list[dict[str, Any]]) -> list[str]:
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        payload_key = next(
-            (
-                key
-                for key in block
-                if key not in {"block_id", "parent_id", "children", "block_type", "comments"}
-            ),
-            None,
-        )
+        payload_key = _payload_key(block)
         if payload_key is None:
             continue
         payload = block.get(payload_key)
@@ -430,15 +413,15 @@ def sync_document_tree(
     result = SyncTreeResult(root=root_path, document_id=root_doc_id)
     visited: set[str] = {wiki_token}
 
-    # 队列元素：(node_token, obj_token, space_id, depth, has_child)
-    queue: list[tuple[str, str, str, int, bool]] = (
+    # 队列元素：(node_token, obj_token, space_id, depth, has_child)；广度优先，deque 免得 pop(0) 退化成 O(n)
+    queue: deque[tuple[str, str, str, int, bool]] = deque(
         _discover_children(client, wiki_token, space_id, root_blocks, result, depth=1)
         if max_depth >= 1
         else []
     )
 
     while queue:
-        node_token, obj_token, child_space, depth, has_child = queue.pop(0)
+        node_token, obj_token, child_space, depth, has_child = queue.popleft()
         if node_token in visited:
             continue
         visited.add(node_token)

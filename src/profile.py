@@ -12,18 +12,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
 import time
 from typing import Iterable, Sequence
 
 from .distill import KnowledgePoint
+from .fileio import write_text_atomic
 
 # 四态与 [[模块-知识画像]] 一致；rank 越大表示掌握程度越高。
 # 「输出」= 能用自己的话把知识讲清楚（费曼复述），是 T-019 新增的最高态。
 LEVEL_RANK = {"存疑": 0, "学过": 1, "做过": 2, "输出": 3}
 LEVELS = ("学过", "做过", "输出", "存疑")
+# 「已掌握」的唯一口径：除「存疑」之外的三态（出题、接力上下文、周报都用它）。
+# 以前 planner 自己写了一份 ("学过", "做过")，漏了 T-019 加的最高态「输出」——
+# 结果复述过的点在出题 prompt 里被当成「仍存疑」，甚至会被选成「下一个新点」。
+MASTERED_LEVELS = ("学过", "做过", "输出")
 
 DEFAULT_TOPIC = "未分类"
 DEFAULT_HEADER = "# 知识画像"
@@ -37,6 +42,10 @@ _LAST_TOUCHED_RE = re.compile(r"\s*[—-]\s*最近：(?P<when>\d{4}-\d{2}-\d{2})
 
 class ProfileError(RuntimeError):
     """画像读写失败：结构不合法、合并冲突或落盘失败。旧文件保持不变。"""
+
+
+class PointNotFoundError(ProfileError):
+    """画像里没有这个知识点（与「同名歧义」区分开：done / 改状态遇到它会新增条目）。"""
 
 
 @dataclass
@@ -176,17 +185,7 @@ def touch_points(profile: KnowledgeProfile, names, *, when: str = "") -> Knowled
         return KnowledgeProfile(points=list(profile.points), header=profile.header)
     moment = when or time.strftime("%Y-%m-%d")
     updated = [
-        (
-            KnowledgePoint(
-                name=point.name,
-                level=point.level,
-                evidence=point.evidence,
-                topic=point.topic,
-                last_touched=moment,
-            )
-            if point.name in wanted
-            else point
-        )
+        replace(point, last_touched=moment) if point.name in wanted else point
         for point in profile.points
     ]
     return KnowledgeProfile(points=updated, header=profile.header)
@@ -213,15 +212,13 @@ def merge_points(
             existing.append(point)
             continue
         current = existing[position]
-        evidence = _merge_evidence(current.evidence, point.evidence)
-        level = _merge_level(current.level, point.level)
-        existing[position] = KnowledgePoint(
-            name=current.name,
-            level=level,
-            evidence=evidence,
+        existing[position] = replace(
+            current,
+            level=_merge_level(current.level, point.level),
+            evidence=_merge_evidence(current.evidence, point.evidence),
             topic=current.topic or point.topic,
             # T-035：提炼不该抹掉"最近碰过"的时间戳（否则复习队列每次提炼都重置）
-            last_touched=getattr(current, "last_touched", "") or getattr(point, "last_touched", ""),
+            last_touched=current.last_touched or point.last_touched,
         )
 
     return KnowledgeProfile(points=existing, header=profile.header)
@@ -311,7 +308,12 @@ def _resolve_point_index(points: list[KnowledgePoint], name: str) -> int:
         )
 
     everything = "、".join(_candidate_label(point) for point in points) or "（画像为空）"
-    raise ProfileError(f"画像里没有知识点「{wanted}」；可选：{everything}")
+    raise PointNotFoundError(f"画像里没有知识点「{wanted}」；可选：{everything}")
+
+
+def _with_recital(evidence: str, spoken: str) -> str:
+    """有费曼复述时把「复述：…」并进证据（T-019）。"""
+    return _merge_evidence(evidence, f"复述：{spoken}") if spoken else evidence
 
 
 def mark_done(
@@ -334,46 +336,35 @@ def mark_done(
     if not product:
         raise ProfileError(f"知识点「{wanted}」缺少产出路径：请给出产出文件或目录")
 
+    spoken = str(recite or "").strip()
+    # 复述本身就是输出能力的证据，所以带复述时升到「输出」态
+    level = "输出" if spoken else "做过"
+    produced = f"产出：{product}"
+
     points = list(_normalize_points(profile.points))
     try:
         target_index = _resolve_point_index(points, name)
-    except ProfileError as exc:
+    except PointNotFoundError:
         # T-023 L-01：画像里没有这个点就**新增条目**，不要报错。
         # 否则核心闭环会断裂——出题/讲解里遇到的新知识点，做完根本没法回写。
-        if "没有知识点" not in str(exc):
-            raise  # 同名歧义等其它情况仍然报错（那是真需要人工判断的）
-        spoken = str(recite or "").strip()
-        evidence = f"产出：{product}"
-        level = "做过"
-        if spoken:
-            evidence = _merge_evidence(evidence, f"复述：{spoken}")
-            level = "输出"
-        points.append(KnowledgePoint(name=str(name).strip(), level=level, evidence=evidence, topic=""))
+        # （同名歧义等其它 ProfileError 仍然抛出：那是真需要人工判断的。）
+        points.append(
+            KnowledgePoint(name=str(name).strip(), level=level, evidence=_with_recital(produced, spoken))
+        )
         return KnowledgeProfile(points=points, header=profile.header)
 
     current = points[target_index]
-    evidence = _merge_evidence(current.evidence, f"产出：{product}")
-
-    spoken = str(recite or "").strip()
-    level = "做过"
-    if spoken:
-        # 复述本身就是输出能力的证据，所以升到「输出」态
-        evidence = _merge_evidence(evidence, f"复述：{spoken}")
-        level = "输出"
-
     # done 只升不降：它记录的是"又做了一次产出"，不是"我要改状态"。
     # 实测回归：已是「输出」的知识点再跑一次普通 done，会被错误降回「做过」。
     # 想显式下调请用 set_level（手工选择优先）。
     if LEVEL_RANK.get(current.level, 0) > LEVEL_RANK.get(level, 0):
         level = current.level
 
-    points[target_index] = KnowledgePoint(
-        name=current.name,
+    # replace 保留其余字段——T-035：回写不能把「最近碰过」抹掉（复习队列靠它判断超期）
+    points[target_index] = replace(
+        current,
         level=level,
-        evidence=evidence,
-        topic=current.topic,
-        # T-035：回写不能把「最近碰过」抹掉（复习队列靠它判断超期）
-        last_touched=getattr(current, "last_touched", ""),
+        evidence=_with_recital(_merge_evidence(current.evidence, produced), spoken),
     )
     return KnowledgeProfile(points=points, header=profile.header)
 
@@ -402,29 +393,22 @@ def set_level(
     points = list(_normalize_points(profile.points))
     try:
         target_index = _resolve_point_index(points, name)
-    except ProfileError as exc:
+    except PointNotFoundError:
         # T-023 L-01：看板手工改状态时也可以**新增**一个画像里没有的知识点
         # （与 done 一致；否则"我学了但笔记里没记"的点永远进不了画像）
-        if "没有知识点" not in str(exc):
-            raise
         points.append(
             KnowledgePoint(
                 name=str(name).strip(),
                 level=level,
                 evidence=note.strip() or "手工新增（来自看板）",
-                topic="",
             )
         )
         return KnowledgeProfile(points=points, header=profile.header)
 
     current = points[target_index]
     evidence = _merge_evidence(current.evidence, note.strip()) if note else current.evidence
-    points[target_index] = KnowledgePoint(
-        name=current.name,
-        level=level,
-        evidence=evidence,
-        topic=current.topic,
-    )
+    # replace 保留 last_touched：手工改状态以前会把它抹掉（与 T-035 修过的 mark_done 同一类问题）
+    points[target_index] = replace(current, level=level, evidence=evidence)
     return KnowledgeProfile(points=points, header=profile.header)
 
 
@@ -438,15 +422,7 @@ def write_profile_atomic(path: Path | str, profile: KnowledgeProfile) -> Path:
     except Exception as exc:
         raise ProfileError(f"渲染画像失败：{type(exc).__name__}") from None
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_name(target.name + ".tmp")
     try:
-        tmp_path.write_text(content, encoding="utf-8")
-        tmp_path.replace(target)
+        return write_text_atomic(target, content)
     except OSError as exc:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise ProfileError(f"写入画像失败：{target}（{type(exc).__name__}）") from None
-    return target

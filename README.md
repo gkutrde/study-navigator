@@ -251,6 +251,7 @@ python -m src.cli report [--days N]   # 周报复盘（T-044）
     │   ├─ repl.py          终端交互模式（chat 不带问题时进循环，T-034）
     │   ├─ report.py        周报复盘（T-044）
     │   ├─ silent.py        静默执行（真机子进程统一 CREATE_NO_WINDOW，T-041）
+    │   ├─ fileio.py        原子写（临时文件 + 替换）与容错读：各模块落盘的唯一实现
     │   ├─ weaknesses.py    错题本：累积/去重/移除问题点（T-035）
     │   ├─ assignments.py   经典课程实验题库的解析与匹配
     │   ├─ syllabus.py      知识地图读写、分块提炼与导入

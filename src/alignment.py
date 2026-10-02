@@ -21,10 +21,14 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import re
+from typing import TYPE_CHECKING
 
+from .fileio import read_text_or_none, write_text_atomic
+from .llm import JSONExtractionError, LLMError, extract_json
 from .syllabus import BookMap, Chapter
 
-from .llm import LLMError
+if TYPE_CHECKING:  # 只用于类型标注；运行时 profile 不需要在这里加载
+    from .profile import KnowledgeProfile
 
 DEFAULT_ALIGNMENT_NAME = "alignment.json"
 DEFAULT_BATCH_SIZE = 150
@@ -32,7 +36,6 @@ DEFAULT_BATCH_SIZE = 150
 _LATIN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#./_-]*")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 _PAREN_RE = re.compile(r"（[^（）]*）\s*$")
-_JSON_DECODER = json.JSONDecoder()
 
 
 class AlignmentError(RuntimeError):
@@ -101,20 +104,14 @@ def _build_messages(profile_names: list[str], batch: list[str]) -> list[dict[str
 
 
 def _extract_json(raw: str):
-    text = (raw or "").strip()
-    if not text:
-        raise AlignmentError("对齐失败：LLM 返回了空内容")
-    starts = [index for index in (text.find("["), text.find("{")) if index >= 0]
-    if not starts:
-        raise AlignmentError("对齐失败：LLM 输出里找不到 JSON")
-    last_error: Exception | None = None
-    for start in sorted(starts):
-        try:
-            value, _ = _JSON_DECODER.raw_decode(text[start:])
-            return value
-        except ValueError as exc:
-            last_error = exc
-    raise AlignmentError(f"对齐失败：LLM 输出的 JSON 无法解析（{last_error}）")
+    try:
+        return extract_json(raw)
+    except JSONExtractionError as exc:
+        if exc.reason == "empty":
+            raise AlignmentError("对齐失败：LLM 返回了空内容") from None
+        if exc.reason == "missing":
+            raise AlignmentError("对齐失败：LLM 输出里找不到 JSON") from None
+        raise AlignmentError(f"对齐失败：LLM 输出的 JSON 无法解析（{exc.detail}）") from None
 
 
 def align_points(
@@ -128,8 +125,6 @@ def align_points(
 
     LLM 给出的概念名必须**精确存在于画像**，否则丢弃并标成 new。
     """
-    from .profile import KnowledgeProfile as _Profile  # 仅用于类型提示，运行时无副作用
-
     names = [str(p) for p in points if str(p).strip()]
     if not names:
         return {}
@@ -186,34 +181,23 @@ def map_point_names(aligned: dict[str, Alignment]) -> dict[str, str | None]:
 def save_alignment(path: Path | str, aligned: dict[str, Alignment]) -> Path:
     """原子落盘（临时文件 + 替换）。"""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": 1,
         "mapped": sum(1 for entry in aligned.values() if not entry.is_new),
         "total": len(aligned),
         "alignments": [entry.as_dict() for entry in aligned.values()],
     }
-    tmp = target.with_name(target.name + ".tmp")
     try:
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(target)
+        return write_text_atomic(target, json.dumps(payload, ensure_ascii=False, indent=2))
     except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise AlignmentError(f"写入对齐结果失败：{target}（{type(exc).__name__}）") from None
-    return target
 
 
 def load_alignment(path: Path | str) -> dict[str, Alignment]:
     """读取对齐结果；文件不存在或损坏都返回空表（不拖垮出题）。"""
-    target = Path(path)
-    if not target.is_file():
-        return {}
     try:
-        payload = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        payload = json.loads(read_text_or_none(path) or "")
+    except ValueError:
         return {}
     items = payload.get("alignments") if isinstance(payload, dict) else payload
     if not isinstance(items, list):

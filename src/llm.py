@@ -21,6 +21,7 @@ import json
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import time
 from typing import Any
 import urllib.error
@@ -92,17 +93,22 @@ def provider_config(
         coding_key = str(values.get(KIMI_CODING_KEY_ENV, "")).strip()
         open_key = str(values.get(KIMI_OPEN_KEY_ENV, "")).strip()
         model = str(values.get(KIMI_MODEL_ENV, "")).strip()
+        base_override = str(values.get(KIMI_BASE_URL_ENV, "")).strip()
+
+        def kimi(default_base: str, default_model: str, api_key: str, api_key_env: str) -> ProviderConfig:
+            # 三条路径只有「默认端点 / 默认模型 / Key 来源」不同；KIMI_BASE_URL / KIMI_MODEL 一律可覆盖
+            return ProviderConfig(
+                name=canonical,
+                base_url=base_override or default_base,
+                model=model or default_model,
+                api_key=api_key,
+                api_key_env=api_key_env,
+                base_url_env=KIMI_BASE_URL_ENV,
+            )
 
         # 1) 显式配了 coding plan Key → 走 coding 端点
         if coding_key:
-            return ProviderConfig(
-                name=canonical,
-                base_url=str(values.get(KIMI_BASE_URL_ENV, "")).strip() or KIMI_CODING_BASE,
-                model=model or KIMI_CODING_MODEL,
-                api_key=coding_key,
-                api_key_env=KIMI_CODING_KEY_ENV,
-                base_url_env=KIMI_BASE_URL_ENV,
-            )
+            return kimi(KIMI_CODING_BASE, KIMI_CODING_MODEL, coding_key, KIMI_CODING_KEY_ENV)
 
         # 2) 没有 Key → 复用 Kimi Code CLI 登录态（T-011，主路径）
         login = load_cli_login(home=home)
@@ -112,25 +118,11 @@ def provider_config(
                     f"Kimi Code CLI 登录态已过期（{login.source}），无法调用 {KIMI_CODING_BASE}。"
                     f"{RELOGIN_HINT}；也可以在 .env 配 {KIMI_CODING_KEY_ENV} 走 API Key。"
                 )
-            return ProviderConfig(
-                name=canonical,
-                base_url=str(values.get(KIMI_BASE_URL_ENV, "")).strip() or KIMI_CODING_BASE,
-                model=model or KIMI_CODING_MODEL,
-                api_key=login.access_token,
-                api_key_env=LOGIN_STATE_ENV_LABEL,
-                base_url_env=KIMI_BASE_URL_ENV,
-            )
+            return kimi(KIMI_CODING_BASE, KIMI_CODING_MODEL, login.access_token, LOGIN_STATE_ENV_LABEL)
 
         # 3) 最后才是开放平台按量 Key
         if open_key:
-            return ProviderConfig(
-                name=canonical,
-                base_url=str(values.get(KIMI_BASE_URL_ENV, "")).strip() or KIMI_OPEN_PLATFORM_BASE,
-                model=model or KIMI_OPEN_PLATFORM_MODEL,
-                api_key=open_key,
-                api_key_env=KIMI_OPEN_KEY_ENV,
-                base_url_env=KIMI_BASE_URL_ENV,
-            )
+            return kimi(KIMI_OPEN_PLATFORM_BASE, KIMI_OPEN_PLATFORM_MODEL, open_key, KIMI_OPEN_KEY_ENV)
 
         raise LLMError(
             "LLM 凭证缺失：三选一——"
@@ -172,10 +164,9 @@ def resolve_provider(
             return "kimi"
     if (values.get("DEEPSEEK_API_KEY") or "").strip():
         return "deepseek"
-    # 没有任何 Key 时，只要存在未过期的 CLI 登录态就选 kimi（T-011 主路径）
-    login = load_cli_login(home=home)
-    if login is not None and not login.is_expired():
-        return "kimi"
+    # 没有任何 Key：默认 kimi——有未过期的 CLI 登录态就走它（T-011 主路径），
+    # 没有的话由 provider_config 报出「三选一」的配置提示。
+    # （以前这里先读一遍登录态文件，但两个分支都返回 kimi，读了也白读。）
     return "kimi"
 
 
@@ -344,6 +335,56 @@ class LLMClient:
             # 传输层异常可能携带请求头（含 Key），只保留异常类型名
             raise LLMError(f"LLM 请求失败：{type(exc).__name__}") from None
         return _extract_content(response)
+
+
+# --- 从 LLM 回复里取 JSON（提炼 / 出题 / 对齐 / 导入地图共用） -------------------
+
+# 注意必须是 raw string：曾经 planner 里写成普通字符串 "\\\\s"，正则变成匹配字面量 \s，
+# 围栏分支从来没生效过（只是靠后面的 raw_decode 兜住了）。
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL)
+_JSON_DECODER = json.JSONDecoder()
+
+
+class JSONExtractionError(ValueError):
+    """LLM 回复里取不出 JSON。reason ∈ {"empty", "missing", "invalid"}，调用方据此给中文提示。"""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(detail or reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def extract_json(raw: str):
+    """从 LLM 回复里取出**第一个完整的 JSON 值**（对象或数组）。
+
+    容忍三种实测出现过的"不听话"：```json 围栏、JSON 前面的寒暄、JSON 后面的说明文字
+    （用 raw_decode，只解析到值结束为止）。先看围栏里的内容，围栏里取不到再看全文。
+
+    失败抛 JSONExtractionError：empty（空回复）/ missing（没有 { 或 [）/ invalid（有但解析不了）。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise JSONExtractionError("empty")
+
+    candidates = []
+    fenced = _JSON_FENCE_RE.search(text)
+    if fenced:
+        candidates.append(fenced.group(1).strip())
+    candidates.append(text)
+
+    saw_start = False
+    last_error: Exception | None = None
+    for candidate in candidates:
+        for start in sorted(i for i in (candidate.find("{"), candidate.find("[")) if i >= 0):
+            saw_start = True
+            try:
+                value, _ = _JSON_DECODER.raw_decode(candidate[start:])
+                return value
+            except ValueError as exc:
+                last_error = exc
+    if not saw_start:
+        raise JSONExtractionError("missing")
+    raise JSONExtractionError("invalid", str(last_error))
 
 
 def _extract_content(response) -> str:
