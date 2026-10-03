@@ -738,13 +738,14 @@ def _build_board(
             )
         )
 
-    def op_next() -> str:
+    def op_next(topics=None) -> str:
         # T-035：把错题本与"多久算超期"一起带下去（看板与 CLI 走同一条路）
+        # 热修（PR#1 回归）：看板会传入主题列表，op_next 必须接收并透传
         from .weaknesses import weaknesses_text
 
         complaints = weaknesses_text(target.parent)
         return capture(
-            lambda topics=None: _run_next(
+            lambda: _run_next(
                 [],
                 env_path,
                 home=home,
